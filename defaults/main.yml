@@ -1,0 +1,462 @@
+---
+# ==============================================================================
+# Install
+# ==============================================================================
+
+# Exact OpenBao version (X.Y.Z), minimum 2.7.2 (2.7.0 and 2.7.1 are refused).
+# Changing it is an upgrade and triggers a health-gated rolling restart.
+openbao_version: "2.7.3"
+
+# Installation method: 'package' (signed pkgs.openbao.org repository) or
+# 'binary' (GPG-verified GitHub release tarball, for mirrors and air-gapped
+# hosts).
+openbao_install_method: "package"
+
+# Protect the pinned version from unrelated upgrades: dpkg hold on the Debian
+# family, repository disabled by default on EL.
+openbao_package_hold: true
+
+# APT repository URL (suite 'stable', component 'main'). Point it at a mirror
+# if needed.
+openbao_apt_repo_url: "https://pkgs.openbao.org/deb/"
+
+# DNF repository base URL ($basearch is expanded by dnf).
+openbao_rpm_repo_baseurl: "https://pkgs.openbao.org/rpm/$basearch"
+
+# URL of the signing key used for packages, release checksums and KMS plugins.
+# Downloaded only while no verified key is installed on the host.
+openbao_gpg_key_url: "https://openbao.org/assets/openbao-gpg-pub-20240618.asc"
+
+# Expected primary fingerprint of the signing key. The role refuses any other
+# key and any key file that holds more than one key.
+openbao_gpg_key_fingerprint: "66D15FDD87287219C8E15478D200CD702853E6D0"
+
+# Base URL for the binary method; '/v<version>/<asset>' is appended.
+openbao_binary_base_url: "https://github.com/openbao/openbao/releases/download"
+
+# GPG-verify checksums.txt (binary method) and the KMS plugin archive. Set
+# false only together with a pinned checksum (openbao_binary_checksum or
+# openbao_seal_plugin_checksum); unverified downloads are refused.
+openbao_binary_verify_gpg: true
+
+# Optional pinned SHA-256 (64 lowercase hex characters) of the release tarball
+# for this host's architecture. Set it per architecture through a map keyed by
+# openbao_arch (see docs/CONFIGURATION.md). Empty = rely on the GPG check.
+openbao_binary_checksum: ""
+
+# Upstream architecture name. Explicit amd64/arm64 map; any other architecture
+# resolves to "" and is rejected by validate.yml.
+openbao_arch: "{{ {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(ansible_facts['architecture'], '') }}"
+
+# ==============================================================================
+# Paths / users
+# ==============================================================================
+
+# Directory that holds openbao.hcl and openbao.env.
+openbao_config_dir: "/etc/openbao"
+
+# Raft integrated storage data directory.
+openbao_data_dir: "/opt/openbao/data"
+
+# Directory for TLS material (certificate, key, CA).
+openbao_tls_dir: "/opt/openbao/tls"
+
+# Audit log directory; openbao_audit_file_path must be inside it.
+openbao_audit_dir: "/opt/openbao/audit"
+
+# External plugin directory. Created and configured only for the cloud KMS
+# seals (awskms, azurekeyvault, gcpckms).
+openbao_plugin_dir: "/opt/openbao/plugins"
+
+# Service user (the package creates it; the binary method creates it in tasks).
+openbao_user: "openbao"
+
+# Service group.
+openbao_group: "openbao"
+
+# Path of the bao binary. Computed from the install method; override only when
+# your distribution places it elsewhere.
+openbao_bin_path: "{{ '/usr/local/bin/bao' if openbao_install_method == 'binary' else '/usr/bin/bao' }}"
+
+# ==============================================================================
+# Listener / addresses / UI
+# ==============================================================================
+
+# API listener bind address, host:port.
+openbao_listen_address: "0.0.0.0:8200"
+
+# Cluster listener bind address, host:port.
+openbao_cluster_listen_address: "0.0.0.0:8201"
+
+# Advertised API URL of this node and the address the role uses for its own
+# status probes, so the server certificate must cover its host. Scheme follows
+# openbao_tls_enabled, port follows openbao_listen_address. Falls back to the
+# inventory name when the host has no default route.
+openbao_api_addr: "{{ 'https' if openbao_tls_enabled | bool else 'http' }}://{{ ansible_facts['default_ipv4']['address'] | default(inventory_hostname) }}:{{ openbao_listen_address.split(':') | last }}"
+
+# Advertised cluster URL of this node. Port follows
+# openbao_cluster_listen_address.
+openbao_cluster_addr: "https://{{ ansible_facts['default_ipv4']['address'] | default(inventory_hostname) }}:{{ openbao_cluster_listen_address.split(':') | last }}"
+
+# Enable the web UI.
+openbao_ui: true
+
+# Cluster name. Empty = omitted from the config, OpenBao generates one.
+openbao_cluster_name: ""
+
+# Extra keys for the API listener stanza (for example
+# x_forwarded_for_authorized_addrs, tls_auto_reload). Values: bool, number,
+# string, or list of strings.
+openbao_listener_extra_parameters: {}
+
+# ==============================================================================
+# TLS
+# ==============================================================================
+
+# Enable TLS on the API listener. False renders tls_disable = true (leaving
+# both unset would make OpenBao start ACME). Disable only for local dev/test.
+openbao_tls_enabled: true
+
+# Server certificate file (full chain PEM). With BYO TLS it must exist on the
+# host before the role runs.
+openbao_tls_cert_file: "{{ openbao_tls_dir }}/openbao-cert.pem"
+
+# Server private key file.
+openbao_tls_key_file: "{{ openbao_tls_dir }}/openbao-key.pem"
+
+# CA bundle used for retry_join and the role's own probes.
+openbao_tls_ca_file: "{{ openbao_tls_dir }}/openbao-ca.pem"
+
+# Minimum TLS version accepted by the listener: 'tls12' or 'tls13'.
+openbao_tls_min_version: "tls12"
+
+# Maximum TLS version accepted by the listener: 'tls12' or 'tls13'.
+openbao_tls_max_version: "tls13"
+
+# TLS 1.2 cipher suites, rendered only when min and max are both 'tls12'
+# (ignored under TLS 1.3). GCM and ChaCha20 suites only, no 3DES.
+openbao_tls_cipher_suites: >-
+  TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+
+# Do not request client certificates on the API listener. Keep true unless API
+# clients must use mutual TLS.
+openbao_tls_disable_client_certs: true
+
+# Generate a CA and per-node certificates with community.crypto. Dev/test
+# only: the CA key is copied to every node. Supply BYO files in production.
+openbao_tls_generate_certs: false
+
+# Key type of generated certificates: 'ECC' or 'RSA'.
+openbao_tls_cert_key_type: "ECC"
+
+# Curve of generated ECC keys.
+openbao_tls_cert_curve: "secp384r1"
+
+# Size of generated RSA keys (used when openbao_tls_cert_key_type is 'RSA').
+openbao_tls_cert_size: 4096
+
+# Validity of generated certificates (community.crypto ownca_not_after syntax).
+openbao_tls_cert_validity: "+825d"
+
+# Shared DNS SAN used as leader_tls_servername in every retry_join block.
+# Generated certificates carry it; BYO certificates must contain it.
+openbao_tls_leader_servername: "openbao.cluster.internal"
+
+# Extra SANs for generated certificates, already prefixed ('DNS:' or 'IP:').
+openbao_tls_extra_sans: []
+
+# Install the CA into the OS trust store.
+openbao_tls_install_ca_to_trust_store: true
+
+# ==============================================================================
+# Storage (Raft)
+# ==============================================================================
+
+# Raft node id. Never use a random value; the role refuses to change it on a
+# node that already holds raft data.
+openbao_raft_node_id: "{{ inventory_hostname }}"
+
+# Inventory names of all cluster members. Defaults to the 'openbao' group;
+# validate.yml fails when several play hosts would each fall back to a
+# single-node cluster (inventory group not named 'openbao').
+openbao_raft_peers: "{{ groups['openbao'] | default([inventory_hostname]) }}"
+
+# Explicit API URLs of all members for retry_join. Empty = each peer's
+# openbao_api_addr. Required for --limit day-2 runs.
+openbao_raft_retry_join_api_addrs: []
+
+# Raft timing multiplier. 1 is the production value.
+openbao_raft_performance_multiplier: 1
+
+# Extra keys for the storage "raft" stanza. Not checked by
+# 'bao operator validate-config', so typos pass silently.
+openbao_raft_extra_parameters: {}
+
+# ==============================================================================
+# Seal / auto-unseal
+# ==============================================================================
+
+# Seal type: 'shamir', 'static', 'transit', 'awskms', 'azurekeyvault' or
+# 'gcpckms'. The cloud seals use external KMS plugins installed by the role.
+# The role refuses to change it on a node with raft data (seal migration is a
+# manual operation).
+openbao_seal_type: "shamir"
+
+# --- Static seal (built in; test setups and externally injected keys only) ---
+
+# Permanent identifier of the static key.
+openbao_seal_static_current_key_id: ""
+
+# Static key: 32 random bytes, base64 or hex. Secret: source it from Ansible
+# Vault. Written to openbao.env only and referenced as env:// in openbao.hcl.
+openbao_seal_static_current_key: ""
+
+# --- Transit seal (built in) ---
+
+# URL of the unsealer OpenBao or Vault (DNS name or VIP, never a node IP).
+openbao_seal_transit_address: ""
+
+# Transit key name on the unsealer.
+openbao_seal_transit_key_name: "autounseal"
+
+# Transit secrets engine mount path on the unsealer.
+openbao_seal_transit_mount_path: "transit/"
+
+# Namespace on the unsealer. Empty = omitted.
+openbao_seal_transit_namespace: ""
+
+# Path on the node to the CA certificate of the unsealer. Empty = omitted.
+openbao_seal_transit_tls_ca_cert: ""
+
+# Disable token renewal. Keep false so the token does not expire.
+openbao_seal_transit_disable_renewal: false
+
+# Token for the unsealer (periodic orphan token). Secret: source it from
+# Ansible Vault. Written as BAO_TOKEN to openbao.env, never to openbao.hcl.
+openbao_seal_transit_token: ""
+
+# --- AWS KMS seal (external plugin) ---
+
+# AWS region of the KMS key.
+openbao_seal_awskms_region: "us-east-1"
+
+# KMS key id or ARN.
+openbao_seal_awskms_kms_key_id: ""
+
+# AWS access key. Secret: source it from Ansible Vault. Empty = use the
+# instance role (preferred).
+openbao_seal_awskms_access_key: ""
+
+# AWS secret key. Secret: source it from Ansible Vault.
+openbao_seal_awskms_secret_key: ""
+
+# --- Azure Key Vault seal (external plugin) ---
+
+# Azure tenant id.
+openbao_seal_azurekeyvault_tenant_id: ""
+
+# Key Vault name.
+openbao_seal_azurekeyvault_vault_name: ""
+
+# Key name in the Key Vault.
+openbao_seal_azurekeyvault_key_name: ""
+
+# Client id of the service principal. Empty = use the managed identity.
+openbao_seal_azurekeyvault_client_id: ""
+
+# Client secret of the service principal. Secret: source it from Ansible
+# Vault.
+openbao_seal_azurekeyvault_client_secret: ""
+
+# --- GCP Cloud KMS seal (external plugin) ---
+
+# GCP project id.
+openbao_seal_gcpckms_project: ""
+
+# Key ring location (for example 'global'), not a compute region.
+openbao_seal_gcpckms_region: ""
+
+# Key ring name.
+openbao_seal_gcpckms_key_ring: ""
+
+# Crypto key name.
+openbao_seal_gcpckms_crypto_key: ""
+
+# Path on the node to a credentials JSON file (an operator-managed secret
+# file). Empty = use the instance identity.
+openbao_seal_gcpckms_credentials: ""
+
+# --- KMS plugin (used by the three cloud seals) ---
+
+# Release version of the KMS plugin (tag kms-<provider>-v<version> in
+# openbao/openbao-plugins). The installed file name carries the version.
+openbao_seal_plugin_version: "0.1.1"
+
+# Base URL for KMS plugin archives.
+openbao_seal_plugin_base_url: "https://github.com/openbao/openbao-plugins/releases/download"
+
+# Optional pinned SHA-256 (64 lowercase hex characters) of the extracted
+# plugin binary for this host's architecture. When set it is also rendered as
+# sha256sum in the plugin stanza.
+openbao_seal_plugin_checksum: ""
+
+# ==============================================================================
+# Init / unseal
+# ==============================================================================
+
+# Initialize the cluster when every node reports "not initialized".
+openbao_init: true
+
+# Unseal Shamir nodes with the stored keys (bootstrap, re-runs, rolling
+# restarts). No effect with auto-unseal seals.
+openbao_unseal: true
+
+# Shamir key shares.
+openbao_init_key_shares: 5
+
+# Shamir key threshold (shares needed to unseal).
+openbao_init_key_threshold: 3
+
+# Recovery key shares (auto-unseal seals). Recovery keys authorize operations
+# such as root token generation; they cannot unseal.
+openbao_init_recovery_shares: 5
+
+# Recovery key threshold (auto-unseal seals).
+openbao_init_recovery_threshold: 3
+
+# Inventory name of the node that runs 'bao operator init'. Must be one of
+# openbao_raft_peers.
+openbao_init_bootstrap_node: "{{ openbao_raft_peers | first | default('') }}"
+
+# PGP public keys (paths on the bootstrap node or 'keybase:' names) that wrap
+# the shares, one per share. With Shamir this requires openbao_unseal: false
+# (the role cannot unseal with wrapped shares). Empty = plain shares,
+# protected by openbao_init_encrypt_output.
+openbao_init_pgp_keys: []
+
+# Controller-side file for the init output (root token and keys). Defaults to
+# the controller user's home, outside any repository. Only a user who can read
+# this file (and the password file) can unseal on later runs; pipelines must
+# point it at persistent, access-controlled storage.
+openbao_init_output_path: "{{ '~/.openbao' | expanduser }}/.openbao_init_{{ openbao_cluster_id }}.json"
+
+# Encrypt the init output with Ansible Vault before it is written.
+openbao_init_encrypt_output: true
+
+# Controller-side plain-text password file used to encrypt the init output and
+# to read it back on later runs. Required when openbao_init and
+# openbao_init_encrypt_output are true: the role fails before installing
+# anything when it is empty.
+openbao_init_encrypt_password_file: ""
+
+# Stable id used in the init file name. Sorted so that reordering the inventory
+# does not change it; set it explicitly in production.
+openbao_cluster_id: "{{ openbao_raft_peers | sort | first | default('') }}"
+
+# ==============================================================================
+# Telemetry / logging / TTLs / hardening
+# ==============================================================================
+
+# Render the telemetry stanza (Prometheus metrics).
+openbao_telemetry_enabled: true
+
+# Prometheus retention time.
+openbao_telemetry_prometheus_retention_time: "24h"
+
+# Do not prefix metrics with the hostname.
+openbao_telemetry_disable_hostname: true
+
+# Allow unauthenticated /v1/sys/metrics on the API listener (needed to scrape
+# standby nodes). Keep false to require a token.
+openbao_telemetry_unauthenticated_metrics_access: false
+
+# Log level: 'trace', 'debug', 'info', 'warn' or 'error'.
+openbao_log_level: "info"
+
+# Log format: 'standard' or 'json'.
+openbao_log_format: "json"
+
+# Default lease TTL (Vault role value; the upstream default is 768h).
+openbao_default_lease_ttl: "1h"
+
+# Maximum lease TTL (Vault role value; the upstream default is 768h).
+openbao_max_lease_ttl: "24h"
+
+# Set BAO_ENABLE_FILE_PERMISSIONS_CHECK=true in openbao.env so OpenBao checks
+# the ownership and mode of its config file and plugins on startup.
+openbao_enable_file_permissions_check: true
+
+# Raw HCL appended verbatim to openbao.hcl (extra top-level keys and stanzas).
+# Must not contain secrets, disable_mlock or an initialize stanza. Not covered
+# by the audit guard.
+openbao_extra_config_hcl: ""
+
+# ==============================================================================
+# Audit
+# ==============================================================================
+
+# Declare a file audit device in openbao.hcl. Setting it to false later
+# removes the device.
+openbao_audit_enabled: true
+
+# Mount path of the audit device. Immutable once applied.
+openbao_audit_path: "file"
+
+# Audit log file, must be inside openbao_audit_dir. Immutable once applied.
+openbao_audit_file_path: "{{ openbao_audit_dir }}/openbao_audit.log"
+
+# Mode OpenBao sets on the audit log file. Immutable once applied.
+openbao_audit_file_mode: "0600"
+
+# Extra audit device options (string values); file_path and mode are set
+# through the dedicated variables. Immutable once applied.
+openbao_audit_options: {}
+
+# Install a logrotate rule for the audit log.
+openbao_audit_logrotate_enabled: true
+
+# Number of daily rotations to keep.
+openbao_audit_logrotate_rotate: 30
+
+# ==============================================================================
+# systemd / permissions
+# ==============================================================================
+
+# Add the role's sandboxing directives on top of the upstream unit. Set false
+# if a directive conflicts with your environment.
+openbao_systemd_hardening: true
+
+# RestartSec of the unit (seconds).
+openbao_systemd_restart_sec: 5
+
+# TimeoutStopSec of the unit (seconds).
+openbao_systemd_timeout_stop_sec: 30
+
+# Mode of the TLS private key file (owner root:<openbao_group>).
+openbao_tls_key_mode: "0640"
+
+# Mode of the TLS certificate and CA files.
+openbao_tls_cert_mode: "0644"
+
+# Run restorecon on the role's directories on EL when SELinux is enabled.
+openbao_manage_selinux: true
+
+# ==============================================================================
+# Service control
+# ==============================================================================
+
+# Enable openbao.service at boot.
+openbao_service_enabled: true
+
+# Desired service state: 'started' or 'stopped'. With 'stopped' the init,
+# unseal and restart stages are skipped and a pending restart waits for the
+# next start.
+openbao_service_state: "started"
+
+# Seconds to wait for a restarted node to be unsealed and to see a leader
+# before the rolling restart aborts.
+openbao_restart_health_timeout: 300
+
+# Render-only mode: skip install, guards, service, init, unseal and restart;
+# handlers are no-ops. Used by the 'render' Molecule scenario.
+openbao_config_only: false

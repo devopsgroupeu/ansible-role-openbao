@@ -1,0 +1,86 @@
+---
+# ==============================================================================
+# Internal role variables (not overridable by consumers)
+# Prefix __openbao_ marks these as internal role variables.
+# ==============================================================================
+
+# Oldest supported OpenBao version. 2.7.0 and 2.7.1 carry the namespace
+# deletion bug; 2.6.x needs sha256sum on plugin stanzas and lacks
+# tls_auto_reload.
+__openbao_min_version: "2.7.2"
+
+# Package dependencies installed before OpenBao, keyed by OS family.
+# python3-debian is required by ansible.builtin.deb822_repository on Debian/Ubuntu;
+# gpg/gnupg2 verifies the signing key, release checksums and KMS plugins.
+__openbao_pkg_deps:
+  Debian:
+    - ca-certificates
+    - gpg
+    - python3-debian
+    - tar
+    - gzip
+    - logrotate
+  RedHat:
+    - ca-certificates
+    - gnupg2
+    - tar
+    - gzip
+    - logrotate
+
+# Python dependencies of community.crypto, installed before generating TLS.
+__openbao_tls_pkg_deps:
+  Debian:
+    - python3-cryptography
+  RedHat:
+    - python3-cryptography
+
+# Role-owned path of the verified signing key, shared by APT (signed_by),
+# DNF (gpgkey=file://), the tarball check and the KMS plugin check.
+__openbao_gpg_key_path: "/usr/local/share/openbao/openbao-signing-key.asc"
+
+# Persistent per-node restart marker. Written right after a config, unit,
+# package, binary or plugin change; removed when service.yml starts a stopped
+# process and after the node passed the restart health gate.
+__openbao_restart_marker: "{{ openbao_config_dir }}/.ansible-restart-pending"
+
+# Environment for the bao CLI (operator init only). BAO_CACERT is added when
+# TLS is enabled. The role never sets BAO_TOKEN.
+__openbao_cli_env: "{{ {'BAO_ADDR': __openbao_api_addr} | combine({'BAO_CACERT': openbao_tls_ca_file} if openbao_tls_enabled | bool else {}) }}"
+
+# Directory into which the CA is installed for OS trust.
+__openbao_ca_trust_dir:
+  Debian: "/usr/local/share/ca-certificates"
+  RedHat: "/etc/pki/ca-trust/source/anchors"
+
+# Command to refresh the OS CA trust store after installing the CA.
+__openbao_ca_trust_update_cmd:
+  Debian: "update-ca-certificates"
+  RedHat: "update-ca-trust"
+
+# Cloud seal type -> upstream KMS plugin provider slug
+# (release tag kms-<slug>-v<version> in openbao/openbao-plugins).
+__openbao_kms_plugins:
+  awskms: "aws"
+  azurekeyvault: "azure"
+  gcpckms: "gcp"
+
+# Go microarchitecture suffix of the KMS plugin release assets
+# (openbao-plugin-kms-<slug>_linux_<arch>_<micro>).
+__openbao_kms_microarch:
+  amd64: "v1"
+  arm64: "v8"
+
+# Installed file name of the KMS plugin inside openbao_plugin_dir, also the
+# 'command' of the plugin stanza. It carries the version, so an upgrade is a
+# new file plus a config change. Defined here, not as a fact, because
+# openbao.hcl.j2 needs it in config-only mode too.
+__openbao_seal_plugin_command: "openbao-plugin-kms-{{ __openbao_kms_plugins.get(openbao_seal_type, '') }}_{{ openbao_seal_plugin_version }}"
+
+# Seal types the role supports (validate.yml rule 5).
+__openbao_seal_types:
+  - shamir
+  - static
+  - transit
+  - awskms
+  - azurekeyvault
+  - gcpckms
