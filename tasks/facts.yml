@@ -1,0 +1,58 @@
+---
+# ==============================================================================
+# Cluster address facts. Included by main.yml right after validate.yml
+# (tag: always), so every later stage has them, also under --tags restart.
+# Produces:
+#   __openbao_api_addr          this node's API URL (role defaults are not
+#                               visible to other hosts through hostvars)
+#   __openbao_member_api_addrs  API URLs of all members, self included
+#   __openbao_retry_join_addrs  API URLs of all members except self
+# ==============================================================================
+
+- name: Publish this node's API address
+  ansible.builtin.set_fact:
+    __openbao_api_addr: "{{ openbao_api_addr }}"
+  tags: always
+
+# --limit guard: without explicit retry_join addresses the member URLs come
+# from the other hosts' facts, so every member must be in the play. Runs
+# before anything is installed.
+- name: Validate that every cluster member is in the play
+  when:
+    - not openbao_config_only | bool
+    - openbao_raft_retry_join_api_addrs | length == 0
+  ansible.builtin.assert:
+    that:
+      - openbao_raft_peers | difference(ansible_play_hosts) | length == 0
+    fail_msg: >-
+      Cluster members are missing from this play.
+      Missing: {{ openbao_raft_peers | difference(ansible_play_hosts) | join(', ') }}
+      (play hosts: {{ ansible_play_hosts | join(', ') }}). Run against the
+      whole inventory group without --limit, or set
+      openbao_raft_retry_join_api_addrs to the API URLs of all members.
+    quiet: true
+  tags: always
+
+# A peer outside the play (config-only mode) gets <scheme>://<name>:<port>.
+- name: Derive the API addresses of all cluster members
+  ansible.builtin.set_fact:
+    __openbao_member_api_addrs: >-
+      {%- if openbao_raft_retry_join_api_addrs | length > 0 -%}
+      {{ openbao_raft_retry_join_api_addrs | list }}
+      {%- else -%}
+      {%- set ns = namespace(addrs=[]) -%}
+      {%- for peer in openbao_raft_peers -%}
+      {%- if peer in ansible_play_hosts -%}
+      {%- set ns.addrs = ns.addrs + [hostvars[peer]['__openbao_api_addr']] -%}
+      {%- else -%}
+      {%- set ns.addrs = ns.addrs + [('https' if openbao_tls_enabled | bool else 'http') ~ '://' ~ peer ~ ':' ~ (openbao_listen_address.split(':') | last)] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.addrs }}
+      {%- endif -%}
+  tags: always
+
+- name: Derive the retry_join addresses (all members except this node)
+  ansible.builtin.set_fact:
+    __openbao_retry_join_addrs: "{{ __openbao_member_api_addrs | reject('equalto', __openbao_api_addr) | list }}"
+  tags: always

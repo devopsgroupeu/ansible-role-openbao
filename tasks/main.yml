@@ -1,3 +1,8 @@
 ---
-- name: Placeholder until the stages are added
-  ansible.builtin.meta: noop
+- name: Validate configuration variables
+  ansible.builtin.include_tasks: validate.yml
+  tags: always
+
+- name: Derive cluster address facts
+  ansible.builtin.include_tasks: facts.yml
+  tags: always

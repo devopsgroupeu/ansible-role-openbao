@@ -1,0 +1,30 @@
+---
+# Converge for the offline render scenario.
+# openbao_config_only: true skips install, guards, service, init, unseal and
+# restart; nothing is downloaded or started. The verify plays re-include the
+# role with variants (positive renders, then the fail-closed negative cases).
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Render-only mode: no install, no service, no init.
+    openbao_config_only: true
+
+    # Three members, two of them outside the play (config-only address fallback).
+    openbao_raft_peers:
+      - openbao-render
+      - openbao-node-2
+      - openbao-node-3
+
+    # Deterministic advertised API address (no default_ipv4 dependency).
+    openbao_api_addr: "https://127.0.0.1:8200"
+
+    # Deterministic advertised cluster address.
+    openbao_cluster_addr: "https://127.0.0.1:8201"
+
+  tasks:
+    - name: Include openbao role
+      ansible.builtin.include_role:
+        name: ansible-role-openbao

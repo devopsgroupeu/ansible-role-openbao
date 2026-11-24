@@ -1,0 +1,319 @@
+---
+# Verify for the offline render scenario.
+# Negative cases: one play per fail-closed validation. Each play includes the
+# role inside block/rescue with the converge vars (plays do not inherit them)
+# plus the case override, and asserts the static headline sentence of the
+# expected failure message. A case whose guard does not fire reaches the
+# "Fail because the role did not fail" task, and the rescue assert reports it.
+
+- name: Negative - no password file
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with encryption requested but no password file
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: false
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_init_encrypt_password_file: ""
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Init output encryption requested but no password file set.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - threshold greater than shares
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with a key threshold above the share count
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 2
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Invalid Shamir or recovery share settings.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - unsupported seal type
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        # rolespec_validate: false skips the automatic argument spec check,
+        # whose 'choices' would reject pkcs11 first. This proves that
+        # validate.yml still refuses the value for consumers who disable
+        # argument validation.
+        - name: Include the role with an unsupported seal type
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            rolespec_validate: false
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_seal_type: pkcs11
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unsupported openbao_seal_type.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - unsafe version
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with OpenBao 2.7.1
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_version: "2.7.1"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unsupported openbao_version.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - disable_mlock in extra HCL
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with disable_mlock in openbao_extra_config_hcl
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_extra_config_hcl: "disable_mlock = false\n"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unsupported content in openbao_extra_config_hcl.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - initialize stanza in extra HCL
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with an initialize stanza in openbao_extra_config_hcl
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_extra_config_hcl: "initialize \"x\" {\n}\n"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unsupported content in openbao_extra_config_hcl.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - unverified binary download
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the binary method, no GPG check and no checksum
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_install_method: binary
+            openbao_binary_verify_gpg: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unverified binary download refused.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - audit file path stdout
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the audit device writing to stdout
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_audit_file_path: stdout
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'openbao_audit_file_path must be inside openbao_audit_dir.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - newline in a secret
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with a transit token that contains a newline
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_seal_type: transit
+            openbao_seal_transit_address: "https://u.example:8200"
+            openbao_seal_transit_token: "a\nb"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'A secret variable contains a newline or NUL character.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - cluster members missing from the play (--limit guard)
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        # openbao-node-2 and openbao-node-3 are not in this play and no
+        # explicit retry_join addresses are set: facts.yml must stop the run
+        # before anything is installed.
+        - name: Include the role outside config-only mode with members missing
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: false
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_init: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Cluster members are missing from this play.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"

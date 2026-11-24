@@ -1,0 +1,497 @@
+---
+# ==============================================================================
+# Input validation (fail closed). Included first by main.yml (tag: always), so
+# it runs before anything is installed or rendered, also under --tags.
+# One assert per rule of spec section 6.14, in that order. Every fail_msg
+# starts with a static headline sentence (no Jinja) that docs and tests match;
+# the following sentences echo the value, the valid values and the fix.
+# Secret values are never echoed, only variable names.
+# ==============================================================================
+
+# --- Choices and formats ------------------------------------------------------
+
+# Rule 1.
+- name: Validate openbao_install_method
+  ansible.builtin.assert:
+    that:
+      - openbao_install_method in ['package', 'binary']
+    fail_msg: >-
+      Unsupported openbao_install_method.
+      Got '{{ openbao_install_method }}'; valid values: package, binary.
+      Use 'package' (signed pkgs.openbao.org repository) unless you need the
+      release tarball from a mirror or an air-gapped host.
+    quiet: true
+  tags: always
+
+# Rule 2.
+- name: Validate the CPU architecture
+  ansible.builtin.assert:
+    that:
+      - openbao_arch in ['amd64', 'arm64']
+    fail_msg: >-
+      Unsupported CPU architecture for OpenBao.
+      ansible_facts['architecture'] is '{{ ansible_facts['architecture'] | default('unknown') }}',
+      which resolves to openbao_arch '{{ openbao_arch }}'. Supported: amd64
+      (x86_64) and arm64 (aarch64). Run the role on a supported host, or set
+      openbao_arch to amd64 or arm64 if the fact is reported under another name.
+    quiet: true
+  tags: always
+
+# Rule 3.
+- name: Validate the OS family
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] | default('') in ['Debian', 'RedHat']
+    fail_msg: >-
+      Unsupported OS family for OpenBao.
+      ansible_facts['os_family'] is '{{ ansible_facts['os_family'] | default('unknown') }}';
+      supported: Debian (Debian, Ubuntu) and RedHat (EL 9). Make sure facts
+      are gathered (gather_facts: true) and run the role on a supported host.
+    quiet: true
+  tags: always
+
+# Rule 4. 2.7.0 and 2.7.1 carry the namespace deletion bug; 2.6.x needs
+# sha256sum on plugin stanzas and lacks tls_auto_reload.
+- name: Validate openbao_version
+  ansible.builtin.assert:
+    that:
+      - >-
+        (openbao_version | string) is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+        and (openbao_version | string) is version(__openbao_min_version, '>=')
+    fail_msg: >-
+      Unsupported openbao_version.
+      Got '{{ openbao_version }}'; it must be an exact X.Y.Z version of at
+      least {{ __openbao_min_version }}. 2.7.0 and 2.7.1 are unsafe (namespace
+      deletion bug) and 2.6.x is not supported. Set openbao_version to
+      {{ __openbao_min_version }} or later, for example "2.7.3".
+    quiet: true
+  tags: always
+
+# Rule 5. Duplicates the argument spec 'choices' on purpose: it still protects
+# runs with rolespec_validate: false.
+- name: Validate openbao_seal_type
+  ansible.builtin.assert:
+    that:
+      - openbao_seal_type in __openbao_seal_types
+    fail_msg: >-
+      Unsupported openbao_seal_type.
+      Got '{{ openbao_seal_type }}'; valid values:
+      {{ __openbao_seal_types | join(', ') }}. Other seals (pkcs11, kmip,
+      ocikms, ...) are not supported by this role.
+    quiet: true
+  tags: always
+
+# Rule 6.
+- name: Validate the TLS version range
+  ansible.builtin.assert:
+    that:
+      - openbao_tls_min_version in ['tls12', 'tls13']
+      - openbao_tls_max_version in ['tls12', 'tls13']
+      - not (openbao_tls_min_version == 'tls13' and openbao_tls_max_version == 'tls12')
+    fail_msg: >-
+      Invalid OpenBao TLS version range.
+      Got openbao_tls_min_version '{{ openbao_tls_min_version }}' and
+      openbao_tls_max_version '{{ openbao_tls_max_version }}'. Both must be
+      tls12 or tls13, and the minimum must not exceed the maximum.
+    quiet: true
+  tags: always
+
+# Rule 7.
+- name: Validate openbao_tls_cert_key_type
+  ansible.builtin.assert:
+    that:
+      - openbao_tls_cert_key_type in ['ECC', 'RSA']
+    fail_msg: >-
+      Unsupported openbao_tls_cert_key_type.
+      Got '{{ openbao_tls_cert_key_type }}'; valid values: ECC, RSA.
+    quiet: true
+  tags: always
+
+# Rule 8 (log level).
+- name: Validate openbao_log_level
+  ansible.builtin.assert:
+    that:
+      - openbao_log_level in ['trace', 'debug', 'info', 'warn', 'error']
+    fail_msg: >-
+      Invalid openbao_log_level.
+      Got '{{ openbao_log_level }}'; valid values: trace, debug, info, warn,
+      error.
+    quiet: true
+  tags: always
+
+# Rule 8 (log format).
+- name: Validate openbao_log_format
+  ansible.builtin.assert:
+    that:
+      - openbao_log_format in ['standard', 'json']
+    fail_msg: >-
+      Invalid openbao_log_format.
+      Got '{{ openbao_log_format }}'; valid values: standard, json.
+    quiet: true
+  tags: always
+
+# Rule 8 (service state).
+- name: Validate openbao_service_state
+  ansible.builtin.assert:
+    that:
+      - openbao_service_state in ['started', 'stopped']
+    fail_msg: >-
+      Invalid openbao_service_state.
+      Got '{{ openbao_service_state }}'; valid values: started, stopped. Use
+      'stopped' for maintenance; the next run with 'started' starts and
+      unseals the node again.
+    quiet: true
+  tags: always
+
+# Rule 9.
+- name: Validate the listener addresses
+  ansible.builtin.assert:
+    that:
+      - (openbao_listen_address | string) is match('^.+:[0-9]+$')
+      - (openbao_cluster_listen_address | string) is match('^.+:[0-9]+$')
+    fail_msg: >-
+      Invalid OpenBao listener address.
+      Got openbao_listen_address '{{ openbao_listen_address }}' and
+      openbao_cluster_listen_address '{{ openbao_cluster_listen_address }}'.
+      Both must be host:port, for example 0.0.0.0:8200 and 0.0.0.0:8201.
+    quiet: true
+  tags: always
+
+# Rule 10.
+- name: Validate openbao_gpg_key_fingerprint
+  ansible.builtin.assert:
+    that:
+      - (openbao_gpg_key_fingerprint | string) is match('^[0-9A-Fa-f ]{40,50}$')
+      - (openbao_gpg_key_fingerprint | string | replace(' ', '') | length) == 40
+    fail_msg: >-
+      Invalid openbao_gpg_key_fingerprint.
+      Got '{{ openbao_gpg_key_fingerprint }}'; it must be the 40 hex digit
+      primary key fingerprint (spaces allowed), for example
+      66D15FDD87287219C8E15478D200CD702853E6D0 for the OpenBao release key.
+    quiet: true
+  tags: always
+
+# Rule 11.
+- name: Validate the pinned checksums
+  ansible.builtin.assert:
+    that:
+      - openbao_binary_checksum | length == 0 or openbao_binary_checksum is match('^[0-9a-f]{64}$')
+      - openbao_seal_plugin_checksum | length == 0 or openbao_seal_plugin_checksum is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      Invalid pinned checksum.
+      Got openbao_binary_checksum '{{ openbao_binary_checksum }}' and
+      openbao_seal_plugin_checksum '{{ openbao_seal_plugin_checksum }}'. Each
+      must be empty or a SHA-256 of 64 lowercase hex characters for this
+      host's architecture (set it per architecture through a map keyed by
+      openbao_arch, see docs/CONFIGURATION.md).
+    quiet: true
+  tags: always
+
+# --- Cross-variable -----------------------------------------------------------
+
+# Rule 12. The last condition catches an inventory group not named 'openbao':
+# the peers default falls back to [inventory_hostname] and every play host
+# would initialize its own single-node cluster. ansible_play_hosts_all also
+# counts hosts that already failed in this play.
+- name: Validate openbao_raft_peers
+  ansible.builtin.assert:
+    that:
+      - openbao_raft_peers | length > 0
+      - inventory_hostname in openbao_raft_peers
+      - not (ansible_play_hosts_all | length > 1 and openbao_raft_peers | length == 1)
+    fail_msg: >-
+      Invalid openbao_raft_peers.
+      Got {{ openbao_raft_peers }} on {{ inventory_hostname }}
+      ({{ ansible_play_hosts_all | length }} host(s) in this play). The list
+      must name every cluster member and contain this host. Name the inventory
+      group 'openbao' or set openbao_raft_peers explicitly; run independent
+      single nodes in separate plays.
+    quiet: true
+  tags: always
+
+# Rule 13.
+- name: Validate openbao_init_bootstrap_node
+  ansible.builtin.assert:
+    that:
+      - openbao_init_bootstrap_node in openbao_raft_peers
+    fail_msg: >-
+      openbao_init_bootstrap_node is not a cluster member.
+      Got '{{ openbao_init_bootstrap_node }}', members: {{ openbao_raft_peers }}.
+      Set it to one of openbao_raft_peers (the default is the first entry).
+    quiet: true
+  tags: always
+
+# Rule 14.
+- name: Validate the Shamir and recovery share settings
+  ansible.builtin.assert:
+    that:
+      - openbao_init_key_shares | int >= 1
+      - openbao_init_key_threshold | int >= 1
+      - openbao_init_key_threshold | int <= openbao_init_key_shares | int
+      - openbao_init_recovery_shares | int >= 1
+      - openbao_init_recovery_threshold | int >= 1
+      - openbao_init_recovery_threshold | int <= openbao_init_recovery_shares | int
+    fail_msg: >-
+      Invalid Shamir or recovery share settings.
+      Got openbao_init_key_shares {{ openbao_init_key_shares }},
+      openbao_init_key_threshold {{ openbao_init_key_threshold }},
+      openbao_init_recovery_shares {{ openbao_init_recovery_shares }} and
+      openbao_init_recovery_threshold {{ openbao_init_recovery_threshold }}.
+      Shares and thresholds must be at least 1 and each threshold must not
+      exceed its share count.
+    quiet: true
+  tags: always
+
+# Rule 15. OpenBao wraps one share per PGP key: key shares for Shamir,
+# recovery shares for every other seal.
+- name: Validate the number of openbao_init_pgp_keys
+  when: openbao_init_pgp_keys | length > 0
+  ansible.builtin.assert:
+    that:
+      - >-
+        openbao_init_pgp_keys | length ==
+        ((openbao_init_key_shares if openbao_seal_type == 'shamir' else openbao_init_recovery_shares) | int)
+    fail_msg: >-
+      openbao_init_pgp_keys does not match the share count.
+      It has {{ openbao_init_pgp_keys | length }} key(s), but
+      {{ 'openbao_init_key_shares' if openbao_seal_type == 'shamir' else 'openbao_init_recovery_shares' }}
+      is {{ openbao_init_key_shares if openbao_seal_type == 'shamir' else openbao_init_recovery_shares }}.
+      Give exactly one PGP key per share, or leave openbao_init_pgp_keys empty.
+    quiet: true
+  tags: always
+
+# Rule 16.
+- name: Validate that PGP-wrapped Shamir shares are not used for unsealing
+  when:
+    - openbao_init_pgp_keys | length > 0
+    - openbao_seal_type == 'shamir'
+  ansible.builtin.assert:
+    that:
+      - not (openbao_unseal | bool)
+    fail_msg: >-
+      PGP-wrapped Shamir shares require openbao_unseal: false.
+      openbao_init_pgp_keys wraps every unseal share, so the role cannot
+      unseal with them. Set openbao_unseal: false and unseal by hand with the
+      decrypted shares, or leave openbao_init_pgp_keys empty.
+    quiet: true
+  tags: always
+
+# Rule 17. The role probes its own node at this URL, so the scheme must match
+# the listener.
+- name: Validate openbao_api_addr
+  ansible.builtin.assert:
+    that:
+      - (openbao_api_addr | string) is match('^https?://[^/]+:[0-9]+$')
+      - (openbao_api_addr | string).startswith('https://' if openbao_tls_enabled | bool else 'http://')
+    fail_msg: >-
+      Invalid openbao_api_addr.
+      Got '{{ openbao_api_addr }}' with openbao_tls_enabled
+      {{ openbao_tls_enabled | bool }}. It must be
+      {{ 'https' if openbao_tls_enabled | bool else 'http' }}://<host>:<port>
+      with no path, for example
+      {{ 'https' if openbao_tls_enabled | bool else 'http' }}://10.0.0.11:8200.
+    quiet: true
+  tags: always
+
+# Rule 18. disable_mlock = false is fatal on OpenBao 2.x, and the initialize
+# stanza (declarative self-initialization) is not supported by this role.
+- name: Validate openbao_extra_config_hcl
+  ansible.builtin.assert:
+    that:
+      - openbao_extra_config_hcl is not search('disable_mlock')
+      - openbao_extra_config_hcl is not search('(?m)^\\s*initialize\\s')
+    fail_msg: >-
+      Unsupported content in openbao_extra_config_hcl.
+      It must not contain disable_mlock (OpenBao refuses to start with
+      disable_mlock = false and the role relies on MemorySwapMax=0 instead)
+      or an initialize stanza (self-initialization is not supported; the role
+      runs bao operator init). Remove these lines.
+    quiet: true
+  tags: always
+
+# Rule 19.
+- name: Validate openbao_audit_options
+  ansible.builtin.assert:
+    that:
+      - "'file_path' not in openbao_audit_options"
+      - "'mode' not in openbao_audit_options"
+    fail_msg: >-
+      openbao_audit_options must not set file_path or mode.
+      Got keys {{ openbao_audit_options | list }}. Set
+      openbao_audit_file_path and openbao_audit_file_mode instead.
+    quiet: true
+  tags: always
+
+# Rule 20. stdout, discard and paths outside the audit directory would break
+# ReadWritePaths of the unit and the logrotate rule.
+- name: Validate openbao_audit_file_path
+  when: openbao_audit_enabled | bool
+  ansible.builtin.assert:
+    that:
+      - (openbao_audit_file_path | string).startswith(openbao_audit_dir ~ '/')
+      - "'..' not in (openbao_audit_file_path | string | split('/'))"
+    fail_msg: >-
+      openbao_audit_file_path must be inside openbao_audit_dir.
+      Got '{{ openbao_audit_file_path }}' with openbao_audit_dir
+      '{{ openbao_audit_dir }}'. Use a file below that directory, for example
+      {{ openbao_audit_dir }}/openbao_audit.log; stdout and discard are not
+      supported.
+    quiet: true
+  tags: always
+
+# Rule 21. Secrets are written as one double-quoted line to openbao.env.
+# Only the variable names are reported, never the values.
+# Backslashes: inside {{ }} Ansible keeps string constants as YAML delivered
+# them (escape_backslashes), so the single backslashes below reach the regex
+# as \n, \r and \x00. Bare conditionals (that:, when:) use normal Jinja
+# escaping instead, which is why the regexes above are written with '\\'.
+- name: Validate that secret variables are single-line
+  vars:
+    __openbao_bad_secrets: >-
+      {{ {'openbao_seal_static_current_key': openbao_seal_static_current_key,
+          'openbao_seal_transit_token': openbao_seal_transit_token,
+          'openbao_seal_awskms_access_key': openbao_seal_awskms_access_key,
+          'openbao_seal_awskms_secret_key': openbao_seal_awskms_secret_key,
+          'openbao_seal_azurekeyvault_client_secret': openbao_seal_azurekeyvault_client_secret}
+         | dict2items | selectattr('value', 'search', '[\n\r\x00]')
+         | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that:
+      - __openbao_bad_secrets | length == 0
+    fail_msg: >-
+      A secret variable contains a newline or NUL character.
+      Affected: {{ __openbao_bad_secrets | join(', ') }} (values not shown).
+      Secrets are written as one quoted line to openbao.env, so line breaks
+      (LF or CR) and NUL bytes are refused. Strip the trailing newline (for
+      example from a file lookup) and re-run.
+    quiet: true
+  tags: always
+
+# --- Required when ------------------------------------------------------------
+
+# Rule 22. Required inputs per seal type. Names only: two of the checked
+# variables are secrets.
+- name: Validate the settings required by the selected seal
+  vars:
+    __openbao_seal_required:
+      shamir: {}
+      static:
+        openbao_seal_static_current_key_id: "{{ openbao_seal_static_current_key_id }}"
+        openbao_seal_static_current_key: "{{ openbao_seal_static_current_key }}"
+      transit:
+        openbao_seal_transit_address: "{{ openbao_seal_transit_address }}"
+        openbao_seal_transit_token: "{{ openbao_seal_transit_token }}"
+      awskms:
+        openbao_seal_awskms_kms_key_id: "{{ openbao_seal_awskms_kms_key_id }}"
+      azurekeyvault:
+        openbao_seal_azurekeyvault_tenant_id: "{{ openbao_seal_azurekeyvault_tenant_id }}"
+        openbao_seal_azurekeyvault_vault_name: "{{ openbao_seal_azurekeyvault_vault_name }}"
+        openbao_seal_azurekeyvault_key_name: "{{ openbao_seal_azurekeyvault_key_name }}"
+      gcpckms:
+        openbao_seal_gcpckms_project: "{{ openbao_seal_gcpckms_project }}"
+        openbao_seal_gcpckms_region: "{{ openbao_seal_gcpckms_region }}"
+        openbao_seal_gcpckms_key_ring: "{{ openbao_seal_gcpckms_key_ring }}"
+        openbao_seal_gcpckms_crypto_key: "{{ openbao_seal_gcpckms_crypto_key }}"
+    __openbao_seal_missing: >-
+      {{ __openbao_seal_required.get(openbao_seal_type, {}) | dict2items
+         | rejectattr('value') | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that:
+      - __openbao_seal_missing | length == 0
+    fail_msg: >-
+      Missing required settings for the selected seal.
+      openbao_seal_type '{{ openbao_seal_type }}' needs
+      {{ __openbao_seal_missing | join(', ') }} to be set (non-empty). Secrets
+      come from Ansible Vault; see docs/CONFIGURATION.md for the inputs of each
+      seal.
+    quiet: true
+  tags: always
+
+# Rule 23.
+- name: Validate openbao_seal_plugin_version for cloud seals
+  when: openbao_seal_type in __openbao_kms_plugins
+  ansible.builtin.assert:
+    that:
+      - openbao_seal_plugin_version | string | length > 0
+    fail_msg: >-
+      openbao_seal_plugin_version is required for cloud seals.
+      openbao_seal_type '{{ openbao_seal_type }}' uses the external KMS plugin
+      openbao-plugin-kms-{{ __openbao_kms_plugins[openbao_seal_type] }}. Set
+      openbao_seal_plugin_version to a release of openbao/openbao-plugins, for
+      example "0.1.1".
+    quiet: true
+  tags: always
+
+# --- Fail-closed preconditions --------------------------------------------------
+
+# Rule 24.
+- name: Validate that the binary download can be verified
+  when: openbao_install_method == 'binary'
+  ansible.builtin.assert:
+    that:
+      - (openbao_binary_verify_gpg | bool) or (openbao_binary_checksum | length > 0)
+    fail_msg: >-
+      Unverified binary download refused.
+      openbao_install_method is 'binary' but openbao_binary_verify_gpg is false
+      and openbao_binary_checksum is empty, so nothing would verify the
+      tarball. Keep openbao_binary_verify_gpg: true, or pin
+      openbao_binary_checksum (SHA-256 of the tarball for this architecture).
+    quiet: true
+  tags: always
+
+# Rule 25.
+- name: Validate that the KMS plugin download can be verified
+  when: openbao_seal_type in __openbao_kms_plugins
+  ansible.builtin.assert:
+    that:
+      - (openbao_binary_verify_gpg | bool) or (openbao_seal_plugin_checksum | length > 0)
+    fail_msg: >-
+      Unverified KMS plugin download refused.
+      openbao_seal_type '{{ openbao_seal_type }}' needs a KMS plugin, but
+      openbao_binary_verify_gpg is false and openbao_seal_plugin_checksum is
+      empty, so nothing would verify the plugin. Keep
+      openbao_binary_verify_gpg: true, or pin openbao_seal_plugin_checksum
+      (SHA-256 of the extracted plugin binary for this architecture).
+    quiet: true
+  tags: always
+
+# Rule 26. Runs before anything is installed, so a cluster is never
+# initialized with keys that cannot be stored safely.
+- name: Validate that encrypted init output has a password file
+  when:
+    - openbao_init | bool
+    - openbao_init_encrypt_output | bool
+    - not openbao_config_only | bool
+  ansible.builtin.assert:
+    that:
+      - openbao_init_encrypt_password_file | length > 0
+    fail_msg: >-
+      Init output encryption requested but no password file set.
+      openbao_init_encrypt_output is true but
+      openbao_init_encrypt_password_file is empty, so the init output (root
+      token and unseal or recovery keys) could not be encrypted before it is
+      written to {{ openbao_init_output_path }} on the controller. This check
+      runs before anything is installed, so the cluster is never initialized
+      with keys that cannot be stored safely. Set
+      openbao_init_encrypt_password_file to a controller-side Ansible Vault
+      password file, or set openbao_init_encrypt_output: false to accept a
+      plain-text init file.
+    quiet: true
+  tags: always
+
+# --- Warnings -----------------------------------------------------------------
+
+# Raft needs a majority: an even member count tolerates no more failures than
+# the next smaller odd count.
+- name: Warn about an even number of cluster members
+  ansible.builtin.debug:
+    msg: >-
+      openbao_raft_peers has {{ openbao_raft_peers | length }} members. Raft
+      needs a majority, so {{ openbao_raft_peers | length }} members tolerate
+      no more failed members than {{ openbao_raft_peers | length - 1 }} would;
+      use an odd count (3 or 5).
+  when:
+    - openbao_raft_peers | length > 1
+    - openbao_raft_peers | length is divisibleby 2
+  run_once: true
+  tags: always
