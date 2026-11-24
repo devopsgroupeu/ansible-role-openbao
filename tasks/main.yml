@@ -1,0 +1,3 @@
+---
+- name: Placeholder until the stages are added
+  ansible.builtin.meta: noop

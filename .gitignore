@@ -1,0 +1,30 @@
+# Python
+venv/
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# IDE / Editor specific files
+.idea/
+.vscode/
+*.swp
+*~
+.cache
+
+# macOS specific files
+.DS_Store
+
+# Ansible
+.ansible
+*.retry
+
+# Molecule
+.molecule/
+
+# Logs
+*.log
+
+# Init output (contains unseal keys - never commit)
+.openbao_init_*.json
