@@ -1,0 +1,64 @@
+{% set __openbao_low_port = (openbao_listen_address.split(':') | last | int) < 1024
+     or (openbao_cluster_listen_address.split(':') | last | int) < 1024 %}
+# Managed by Ansible - do not edit manually.
+# Changes to this file will be overwritten on the next playbook run.
+# Shadows the packaged /usr/lib/systemd/system/openbao.service.
+
+[Unit]
+Description=OpenBao - A tool for managing secrets
+Documentation=https://openbao.org/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty={{ openbao_config_dir }}/openbao.hcl
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+EnvironmentFile={{ openbao_config_dir }}/openbao.env
+User={{ openbao_user }}
+Group={{ openbao_group }}
+ExecStart={{ openbao_bin_path }} server -config={{ openbao_config_dir }}/openbao.hcl
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec={{ openbao_systemd_restart_sec }}
+TimeoutStopSec={{ openbao_systemd_timeout_stop_sec }}
+# No swap for the process (replaces mlock, which OpenBao removed).
+MemorySwapMax=0
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=read-only
+{% if __openbao_low_port %}
+# A listener port below 1024 needs the bind capability.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+{% else %}
+CapabilityBoundingSet=
+{% endif %}
+{% if openbao_systemd_hardening | bool %}
+# Role hardening (openbao_systemd_hardening), not upstream guidance.
+ProtectSystem=strict
+ReadWritePaths={{ openbao_data_dir }}{{ (' ' ~ openbao_audit_dir) if openbao_audit_enabled | bool else '' }}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+{% else %}
+ProtectSystem=full
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target

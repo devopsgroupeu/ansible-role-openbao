@@ -6,3 +6,11 @@
 - name: Derive cluster address facts
   ansible.builtin.include_tasks: facts.yml
   tags: always
+
+- name: Render configuration
+  ansible.builtin.include_tasks: config.yml
+  tags: config
+
+- name: Configure TLS
+  ansible.builtin.include_tasks: tls.yml
+  tags: tls

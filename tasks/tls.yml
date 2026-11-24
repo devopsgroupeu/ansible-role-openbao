@@ -1,0 +1,40 @@
+---
+# ==============================================================================
+# TLS (spec section 5.6): BYO validation and the OS trust store.
+# Every TLS branch is gated on openbao_tls_enabled: with TLS disabled there
+# are no certificate files to check or to trust.
+# ==============================================================================
+
+- name: Validate and permission the BYO TLS files
+  ansible.builtin.include_tasks: tls_byo.yml
+  when:
+    - openbao_tls_enabled | bool
+    - not openbao_tls_generate_certs | bool
+  tags: tls
+
+# Install the CA (BYO or generated) into the OS trust store. Skipped in
+# config-only mode, where the trust store tooling may be missing.
+- name: Install the OpenBao CA into the OS trust store
+  when:
+    - openbao_tls_enabled | bool
+    - openbao_tls_install_ca_to_trust_store | bool
+    - not openbao_config_only | bool
+  tags: tls
+  block:
+    - name: Copy the CA into the trust store directory
+      ansible.builtin.copy:
+        src: "{{ openbao_tls_ca_file }}"
+        dest: "{{ __openbao_ca_trust_dir[ansible_facts['os_family']] }}/openbao-ca.crt"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: __openbao_ca_trust_result
+      tags: tls
+
+    # Runs on every pass, so a failed update after an earlier copy heals on
+    # the next run; reports changed only when the anchor changed.
+    - name: Update the OS trust store
+      ansible.builtin.command: "{{ __openbao_ca_trust_update_cmd[ansible_facts['os_family']] }}"
+      changed_when: __openbao_ca_trust_result is changed
+      tags: tls

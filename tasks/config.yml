@@ -1,0 +1,135 @@
+---
+# ==============================================================================
+# Config (spec section 5.4): directories, openbao.env, openbao.hcl,
+# openbao.service, restart marker, logrotate rule, SELinux contexts.
+# Runs in config-only mode too; the steps that need an installed host are
+# gated on openbao_config_only.
+# ==============================================================================
+
+# Always executed: re-asserts owners and modes after the package postinst,
+# which runs a recursive chown of /etc/openbao and /opt/openbao. The plugin
+# directory exists only for the cloud KMS seals.
+- name: Create the OpenBao directories
+  ansible.builtin.file:
+    path: "{{ item['path'] }}"
+    state: directory
+    owner: "{{ item['owner'] }}"
+    group: "{{ openbao_group }}"
+    mode: "0750"
+  loop:
+    - path: "{{ openbao_config_dir }}"
+      owner: root
+    - path: "{{ openbao_data_dir }}"
+      owner: "{{ openbao_user }}"
+    - path: "{{ openbao_tls_dir }}"
+      owner: root
+    - path: "{{ openbao_audit_dir }}"
+      owner: "{{ openbao_user }}"
+    - path: "{{ openbao_plugin_dir }}"
+      owner: "{{ openbao_user }}"
+      enabled: "{{ openbao_seal_type in __openbao_kms_plugins }}"
+  loop_control:
+    label: "{{ item['path'] }}"
+  when: item['enabled'] | default(true) | bool
+  tags: config
+
+# ==============================================================================
+# Rendered files. openbao.env comes first: a missing EnvironmentFile is a hard
+# unit failure.
+# ==============================================================================
+
+- name: Render openbao.env
+  ansible.builtin.template:
+    src: openbao.env.j2
+    dest: "{{ openbao_config_dir }}/openbao.env"
+    owner: root
+    group: root
+    mode: "0600"
+  register: __openbao_env_result
+  no_log: true
+  tags: config
+
+# Owned by the service user: BAO_ENABLE_FILE_PERMISSIONS_CHECK requires it.
+# The validate hook only parses the file (no TLS files or env needed); it is
+# skipped in config-only mode, where no binary is installed.
+- name: Render openbao.hcl
+  ansible.builtin.template:
+    src: openbao.hcl.j2
+    dest: "{{ openbao_config_dir }}/openbao.hcl"
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0640"
+    backup: true
+    validate: "{{ omit if openbao_config_only | bool else openbao_bin_path ~ ' operator validate-config -config=%s' }}"
+  register: __openbao_hcl_result
+  tags: config
+
+- name: Render the openbao.service unit
+  ansible.builtin.template:
+    src: openbao.service.j2
+    dest: /etc/systemd/system/openbao.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: __openbao_unit_result
+  tags: config
+
+# Restart intent is a persistent marker written by a task, not a handler
+# (spec section 5.8): it survives a run that fails before the restart stage,
+# and the rolling restart in restart.yml removes it per node.
+- name: Record a pending restart after a config change
+  ansible.builtin.copy:
+    content: "restart pending\n"
+    dest: "{{ __openbao_restart_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - __openbao_env_result is changed or __openbao_hcl_result is changed or __openbao_unit_result is changed
+    - not openbao_config_only | bool
+    - not ansible_check_mode
+  tags: config
+
+# ==============================================================================
+# Audit log rotation
+# ==============================================================================
+
+- name: Install the audit log logrotate rule
+  ansible.builtin.template:
+    src: logrotate.j2
+    dest: /etc/logrotate.d/openbao
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - openbao_audit_enabled | bool
+    - openbao_audit_logrotate_enabled | bool
+  tags: config
+
+- name: Remove the audit log logrotate rule
+  ansible.builtin.file:
+    path: /etc/logrotate.d/openbao
+    state: absent
+  when: not (openbao_audit_enabled | bool and openbao_audit_logrotate_enabled | bool)
+  tags: config
+
+# ==============================================================================
+# SELinux contexts (RedHat family only)
+# ==============================================================================
+
+- name: Restore SELinux contexts on the OpenBao directories
+  ansible.builtin.command:
+    argv:
+      - restorecon
+      - -R
+      - "{{ item }}"
+  loop: "{{ [openbao_config_dir, openbao_data_dir, openbao_tls_dir, openbao_audit_dir] + ([openbao_plugin_dir] if openbao_seal_type in __openbao_kms_plugins else []) }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+  when:
+    - openbao_manage_selinux | bool
+    - ansible_facts['os_family'] == 'RedHat'
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+    - not openbao_config_only | bool
+  tags: config

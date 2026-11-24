@@ -1,0 +1,163 @@
+{#
+  hcl_kv renders one key of a free-form dict: bool as true/false, numbers
+  bare, lists as ["a", "b"], everything else as a quoted string (JSON string
+  escapes are valid HCL escapes).
+#}
+{% macro hcl_kv(key, value, indent=0) -%}
+{{ ' ' * indent }}{{ key }} = {% if value is boolean -%}
+{{ value | lower }}
+{%- elif value is number -%}
+{{ value }}
+{%- elif value is string -%}
+{{ value | to_json }}
+{%- elif value is sequence and value is not mapping -%}
+{{ value | map('string') | list | to_json }}
+{%- else -%}
+{{ value | string | to_json }}
+{%- endif %}
+{%- endmacro %}
+# Managed by Ansible - do not edit manually.
+# Changes to this file will be overwritten on the next playbook run.
+
+ui         = {{ openbao_ui | bool | lower }}
+log_level  = "{{ openbao_log_level }}"
+log_format = "{{ openbao_log_format }}"
+
+default_lease_ttl = "{{ openbao_default_lease_ttl }}"
+max_lease_ttl     = "{{ openbao_max_lease_ttl }}"
+{% if openbao_cluster_name %}
+cluster_name      = "{{ openbao_cluster_name }}"
+{% endif %}
+{% if openbao_seal_type in __openbao_kms_plugins %}
+
+plugin_directory = "{{ openbao_plugin_dir }}"
+
+plugin "kms" "{{ openbao_seal_type }}" {
+  command   = "{{ __openbao_seal_plugin_command }}"
+{% if openbao_seal_plugin_checksum %}
+  sha256sum = "{{ openbao_seal_plugin_checksum }}"
+{% endif %}
+}
+{% endif %}
+
+storage "raft" {
+  path                   = "{{ openbao_data_dir }}"
+  node_id                = "{{ openbao_raft_node_id }}"
+  performance_multiplier = {{ openbao_raft_performance_multiplier }}
+{% for key, value in openbao_raft_extra_parameters | dictsort %}
+{{ hcl_kv(key, value, 2) }}
+{% endfor %}
+{% for addr in __openbao_retry_join_addrs %}
+
+  retry_join {
+    leader_api_addr         = "{{ addr }}"
+{% if openbao_tls_enabled | bool %}
+    leader_tls_servername   = "{{ openbao_tls_leader_servername }}"
+    leader_ca_cert_file     = "{{ openbao_tls_ca_file }}"
+{% if not openbao_tls_disable_client_certs | bool %}
+    leader_client_cert_file = "{{ openbao_tls_cert_file }}"
+    leader_client_key_file  = "{{ openbao_tls_key_file }}"
+{% endif %}
+{% endif %}
+  }
+{% endfor %}
+}
+
+listener "tcp" {
+  address         = "{{ openbao_listen_address }}"
+  cluster_address = "{{ openbao_cluster_listen_address }}"
+
+{% if openbao_tls_enabled | bool %}
+  tls_cert_file            = "{{ openbao_tls_cert_file }}"
+  tls_key_file             = "{{ openbao_tls_key_file }}"
+  tls_min_version          = "{{ openbao_tls_min_version }}"
+  tls_max_version          = "{{ openbao_tls_max_version }}"
+  tls_disable_client_certs = {{ openbao_tls_disable_client_certs | bool | lower }}
+{% if openbao_tls_min_version == 'tls12' and openbao_tls_max_version == 'tls12' %}
+  tls_cipher_suites        = "{{ openbao_tls_cipher_suites }}"
+{% endif %}
+{% else %}
+  # Explicit: a listener with neither certificates nor tls_disable starts ACME.
+  tls_disable     = true
+{% endif %}
+{% for key, value in openbao_listener_extra_parameters | dictsort %}
+{{ hcl_kv(key, value, 2) }}
+{% endfor %}
+
+  telemetry {
+    unauthenticated_metrics_access = {{ openbao_telemetry_unauthenticated_metrics_access | bool | lower }}
+  }
+}
+
+api_addr     = "{{ openbao_api_addr }}"
+cluster_addr = "{{ openbao_cluster_addr }}"
+{% if openbao_telemetry_enabled | bool %}
+
+telemetry {
+  prometheus_retention_time = "{{ openbao_telemetry_prometheus_retention_time }}"
+  disable_hostname          = {{ openbao_telemetry_disable_hostname | bool | lower }}
+}
+{% endif %}
+{% if openbao_seal_type == 'static' %}
+
+# The key itself is only in openbao.env.
+seal "static" {
+  current_key_id = "{{ openbao_seal_static_current_key_id }}"
+  current_key    = "env://OPENBAO_SEAL_STATIC_CURRENT_KEY"
+}
+{% elif openbao_seal_type == 'transit' %}
+
+# The unsealer credential is only in openbao.env.
+seal "transit" {
+  address         = "{{ openbao_seal_transit_address }}"
+  key_name        = "{{ openbao_seal_transit_key_name }}"
+  mount_path      = "{{ openbao_seal_transit_mount_path }}"
+{% if openbao_seal_transit_namespace %}
+  namespace       = "{{ openbao_seal_transit_namespace }}"
+{% endif %}
+{% if openbao_seal_transit_tls_ca_cert %}
+  tls_ca_cert     = "{{ openbao_seal_transit_tls_ca_cert }}"
+{% endif %}
+  disable_renewal = "{{ openbao_seal_transit_disable_renewal | bool | lower }}"
+}
+{% elif openbao_seal_type == 'awskms' %}
+
+# Credentials, when set, are only in openbao.env; empty uses the instance role.
+seal "awskms" {
+  region     = "{{ openbao_seal_awskms_region }}"
+  kms_key_id = "{{ openbao_seal_awskms_kms_key_id }}"
+}
+{% elif openbao_seal_type == 'azurekeyvault' %}
+
+# The client secret, when set, is only in openbao.env.
+seal "azurekeyvault" {
+  tenant_id  = "{{ openbao_seal_azurekeyvault_tenant_id }}"
+  vault_name = "{{ openbao_seal_azurekeyvault_vault_name }}"
+  key_name   = "{{ openbao_seal_azurekeyvault_key_name }}"
+{% if openbao_seal_azurekeyvault_client_id %}
+  client_id  = "{{ openbao_seal_azurekeyvault_client_id }}"
+{% endif %}
+}
+{% elif openbao_seal_type == 'gcpckms' %}
+
+seal "gcpckms" {
+  project     = "{{ openbao_seal_gcpckms_project }}"
+  region      = "{{ openbao_seal_gcpckms_region }}"
+  key_ring    = "{{ openbao_seal_gcpckms_key_ring }}"
+  crypto_key  = "{{ openbao_seal_gcpckms_crypto_key }}"
+{% if openbao_seal_gcpckms_credentials %}
+  credentials = "{{ openbao_seal_gcpckms_credentials }}"
+{% endif %}
+}
+{% endif %}
+
+{#
+  The include drops the trailing newline of audit.hcl.j2; the empty line
+  after it terminates the END marker line, so raw HCL never joins it.
+#}
+{% include 'audit.hcl.j2' %}
+
+{% if openbao_extra_config_hcl %}
+
+{{ openbao_extra_config_hcl }}
+{%- endif %}

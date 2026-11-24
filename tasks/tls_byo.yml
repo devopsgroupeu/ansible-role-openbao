@@ -1,0 +1,54 @@
+---
+# ==============================================================================
+# BYO TLS: the operator places certificate, key and CA on every node. The role
+# checks that they exist and enforces owner and mode however they arrived; it
+# never copies them.
+# ==============================================================================
+
+- name: Stat the BYO TLS files
+  ansible.builtin.stat:
+    path: "{{ item['path'] }}"
+  loop:
+    - name: openbao_tls_cert_file
+      path: "{{ openbao_tls_cert_file }}"
+      group: root
+      mode: "{{ openbao_tls_cert_mode }}"
+    - name: openbao_tls_key_file
+      path: "{{ openbao_tls_key_file }}"
+      group: "{{ openbao_group }}"
+      mode: "{{ openbao_tls_key_mode }}"
+    - name: openbao_tls_ca_file
+      path: "{{ openbao_tls_ca_file }}"
+      group: root
+      mode: "{{ openbao_tls_cert_mode }}"
+  loop_control:
+    label: "{{ item['name'] }}"
+  register: __openbao_byo_stat
+  tags: tls
+
+- name: Assert that the BYO TLS files exist
+  ansible.builtin.assert:
+    that:
+      - __openbao_byo_stat['results'] | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      BYO TLS file not found.
+      openbao_tls_generate_certs is false, so the certificate, key and CA must
+      already exist on {{ inventory_hostname }}. Missing:
+      {% for r in __openbao_byo_stat['results'] if not r['stat']['exists'] %}{{ r['item']['name'] }} = {{ r['item']['path'] }}{{ '; ' if not loop.last else '' }}{% endfor %}.
+      Place the files there, fix the path variables, or set
+      openbao_tls_generate_certs: true (dev/test only).
+    quiet: true
+  tags: tls
+
+# Key root:<group> openbao_tls_key_mode; certificate and CA root:root
+# openbao_tls_cert_mode.
+- name: Enforce owner and mode of the BYO TLS files
+  ansible.builtin.file:
+    path: "{{ item['item']['path'] }}"
+    owner: root
+    group: "{{ item['item']['group'] }}"
+    mode: "{{ item['item']['mode'] }}"
+  loop: "{{ __openbao_byo_stat['results'] }}"
+  loop_control:
+    label: "{{ item['item']['name'] }}"
+  tags: tls

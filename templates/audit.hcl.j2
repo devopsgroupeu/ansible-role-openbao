@@ -1,0 +1,20 @@
+{#
+  Declarative file audit device, included by openbao.hcl.j2 and rendered on
+  its own by the audit guard in config.yml. The two marker lines below are a
+  compatibility contract: the guard compares the text between them in the
+  existing openbao.hcl with this template, whitespace-normalized. Never change
+  or remove the markers; the layout between them may change.
+#}
+# BEGIN ANSIBLE MANAGED AUDIT DEVICE
+{% if openbao_audit_enabled | bool %}
+audit "file" "{{ openbao_audit_path }}" {
+  options {
+    file_path = "{{ openbao_audit_file_path }}"
+    mode      = "{{ openbao_audit_file_mode }}"
+{% for key, value in openbao_audit_options | dictsort %}
+    {{ key }} = {{ (value | lower if value is boolean else value | string) | to_json }}
+{% endfor %}
+  }
+}
+{% endif %}
+# END ANSIBLE MANAGED AUDIT DEVICE

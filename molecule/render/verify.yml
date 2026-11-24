@@ -1,10 +1,890 @@
 ---
-# Verify for the offline render scenario.
-# Negative cases: one play per fail-closed validation. Each play includes the
-# role inside block/rescue with the converge vars (plays do not inherit them)
-# plus the case override, and asserts the static headline sentence of the
-# expected failure message. A case whose guard does not fire reaches the
-# "Fail because the role did not fail" task, and the rescue assert reports it.
+# Verify for the offline render scenario (spec section 12.2, List A).
+#
+# Positive cases first: the first play checks the converge result as it is;
+# every later play re-includes the role in the same container with the
+# converge vars (plays do not inherit them) plus one variant, then reads the
+# rendered files (tasks/read_rendered.yml) and asserts on their text.
+#
+# Negative cases after that: one play per fail-closed validation. Each play
+# includes the role inside block/rescue with the converge vars plus the case
+# override, and asserts the static headline sentence of the expected failure
+# message. A case whose guard does not fire reaches the "Fail because the role
+# did not fail" task, and the rescue assert reports it.
+
+- name: Verify - default render
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    # Owner, group and mode of every role-managed path (spec section 7.1).
+    __verify_paths:
+      - path: /etc/openbao
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /etc/openbao/openbao.hcl
+        owner: openbao
+        group: openbao
+        mode: "0640"
+      - path: /etc/openbao/openbao.env
+        owner: root
+        group: root
+        mode: "0600"
+      - path: /etc/systemd/system/openbao.service
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /etc/logrotate.d/openbao
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /opt/openbao/data
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/audit
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/tls
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/tls/openbao-key.pem
+        owner: root
+        group: openbao
+        mode: "0640"
+      - path: /opt/openbao/tls/openbao-cert.pem
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /opt/openbao/tls/openbao-ca.pem
+        owner: root
+        group: root
+        mode: "0644"
+    # Paths that must not exist after a config-only run.
+    __verify_absent_paths:
+      - /etc/openbao/.ansible-restart-pending
+      - /usr/local/share/ca-certificates/openbao-ca.crt
+      - /etc/pki/ca-trust/source/anchors/openbao-ca.crt
+      - /opt/openbao/plugins
+    # The [H] directives of spec section 7.4 with the default paths.
+    __verify_hardening_lines:
+      - ProtectSystem=strict
+      - ReadWritePaths=/opt/openbao/data /opt/openbao/audit
+      - ProtectKernelTunables=yes
+      - ProtectKernelModules=yes
+      - ProtectKernelLogs=yes
+      - ProtectControlGroups=yes
+      - ProtectClock=yes
+      - ProtectHostname=yes
+      - RestrictSUIDSGID=yes
+      - RestrictRealtime=yes
+      - RestrictNamespaces=yes
+      - LockPersonality=yes
+      - RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+      - SystemCallArchitectures=native
+      - UMask=0077
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the top-level keys and the absence of mlock, seal and secrets
+      ansible.builtin.assert:
+        that:
+          - "'disable_mlock' not in __verify_hcl"
+          - "'ui = true' in __verify_hcl_n"
+          - "'log_level = \"info\"' in __verify_hcl_n"
+          - "'log_format = \"json\"' in __verify_hcl_n"
+          - "'default_lease_ttl = \"1h\"' in __verify_hcl_n"
+          - "'max_lease_ttl = \"24h\"' in __verify_hcl_n"
+          - "'cluster_name' not in __verify_hcl"
+          - "'api_addr = \"https://127.0.0.1:8200\"' in __verify_hcl_n"
+          - "'cluster_addr = \"https://127.0.0.1:8201\"' in __verify_hcl_n"
+          - "'prometheus_retention_time = \"24h\"' in __verify_hcl_n"
+          - "'disable_hostname = true' in __verify_hcl_n"
+          - "'seal \"' not in __verify_hcl"
+          - "'plugin_directory' not in __verify_hcl"
+          - "'plugin \"kms\"' not in __verify_hcl"
+          - "'token' not in __verify_hcl"
+          - "'env://' not in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: openbao.hcl top level is as expected
+
+    - name: Assert the raft stanza with two retry_join blocks (self excluded)
+      ansible.builtin.assert:
+        that:
+          - "'storage \"raft\" {' in __verify_hcl"
+          - "'path = \"/opt/openbao/data\"' in __verify_hcl_n"
+          - "'node_id = \"openbao-render\"' in __verify_hcl_n"
+          - "'performance_multiplier = 1' in __verify_hcl_n"
+          - "__verify_hcl.count('retry_join {') == 2"
+          - "'leader_api_addr = \"https://openbao-node-2:8200\"' in __verify_hcl_n"
+          - "'leader_api_addr = \"https://openbao-node-3:8200\"' in __verify_hcl_n"
+          - __verify_leaders == ['https://openbao-node-2:8200', 'https://openbao-node-3:8200']
+          - "__verify_hcl_n.count('leader_tls_servername = \"openbao.cluster.internal\"') == 2"
+          - "__verify_hcl_n.count('leader_ca_cert_file = \"/opt/openbao/tls/openbao-ca.pem\"') == 2"
+          - "'leader_client_cert_file' not in __verify_hcl"
+          - "'leader_client_key_file' not in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: retry_join points at the two other members over https
+
+    - name: Assert the TLS listener (no cipher suites under TLS 1.3)
+      ansible.builtin.assert:
+        that:
+          - "'listener \"tcp\" {' in __verify_hcl"
+          - "'address = \"0.0.0.0:8200\"' in __verify_hcl_n"
+          - "'cluster_address = \"0.0.0.0:8201\"' in __verify_hcl_n"
+          - "'tls_cert_file = \"/opt/openbao/tls/openbao-cert.pem\"' in __verify_hcl_n"
+          - "'tls_key_file = \"/opt/openbao/tls/openbao-key.pem\"' in __verify_hcl_n"
+          - "'tls_min_version = \"tls12\"' in __verify_hcl_n"
+          - "'tls_max_version = \"tls13\"' in __verify_hcl_n"
+          - "'tls_disable_client_certs = true' in __verify_hcl_n"
+          - "'tls_cipher_suites' not in __verify_hcl"
+          - "'tls_disable ' not in __verify_hcl_n"
+          - "'unauthenticated_metrics_access = false' in __verify_hcl_n"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: TLS listener is as expected
+
+    - name: Assert the audit device between the two marker lines
+      ansible.builtin.assert:
+        that:
+          - "'# BEGIN ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
+          - "'# END ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
+          - "__verify_hcl.count('audit \"') == 1"
+          - "'audit \"file\" \"file\" {' in __verify_audit_n"
+          - "'file_path = \"/opt/openbao/audit/openbao_audit.log\"' in __verify_audit_n"
+          - "'mode = \"0600\"' in __verify_audit_n"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: audit device is declared between the markers
+
+    - name: Assert openbao.env holds only the permission check line
+      ansible.builtin.assert:
+        that:
+          - __verify_env_lines | reject('match', '#') | reject('equalto', '') | list == ['BAO_ENABLE_FILE_PERMISSIONS_CHECK="true"']
+        fail_msg: "{{ __verify_env }}"
+        success_msg: openbao.env is as expected
+
+    - name: Assert the hardened unit without mlock-era directives
+      ansible.builtin.assert:
+        that:
+          - "'Type=notify' in __verify_unit_lines"
+          - "'EnvironmentFile=/etc/openbao/openbao.env' in __verify_unit_lines"
+          - "'User=openbao' in __verify_unit_lines"
+          - "'Group=openbao' in __verify_unit_lines"
+          - "'ExecStart=/usr/bin/bao server -config=/etc/openbao/openbao.hcl' in __verify_unit_lines"
+          - "'ExecReload=/bin/kill --signal HUP $MAINPID' in __verify_unit_lines"
+          - "'ConditionFileNotEmpty=/etc/openbao/openbao.hcl' in __verify_unit_lines"
+          - "'MemorySwapMax=0' in __verify_unit_lines"
+          - "'LimitCORE=0' in __verify_unit_lines"
+          - "'NoNewPrivileges=yes' in __verify_unit_lines"
+          - "'CapabilityBoundingSet=' in __verify_unit_lines"
+          - "'ProtectSystem=full' not in __verify_unit_lines"
+          - "'AmbientCapabilities' not in __verify_unit"
+          - "'CAP_IPC_LOCK' not in __verify_unit"
+          - "'LimitMEMLOCK' not in __verify_unit"
+          - "'LimitNOFILE' not in __verify_unit"
+          - "'SecureBits' not in __verify_unit"
+          - __verify_hardening_lines | difference(__verify_unit_lines) | length == 0
+        fail_msg: "{{ __verify_unit }}"
+        success_msg: openbao.service is hardened
+
+    - name: Read the logrotate rule
+      ansible.builtin.slurp:
+        src: /etc/logrotate.d/openbao
+      register: __verify_logrotate_raw
+
+    - name: Assert the logrotate rule
+      ansible.builtin.assert:
+        that:
+          - "'/opt/openbao/audit/openbao_audit.log {' in __verify_logrotate_text.splitlines()"
+          - "'    rotate 30' in __verify_logrotate_text.splitlines()"
+          - "'        /bin/systemctl reload openbao.service > /dev/null 2>&1 || true' in __verify_logrotate_text.splitlines()"
+          - __verify_logrotate_text is not search('(?m)^\\s*su\\s')
+        fail_msg: "{{ __verify_logrotate_text }}"
+        success_msg: logrotate rule is as expected
+      vars:
+        __verify_logrotate_text: "{{ __verify_logrotate_raw['content'] | b64decode }}"
+
+    - name: Stat the role-managed paths
+      ansible.builtin.stat:
+        path: "{{ item['path'] }}"
+      loop: "{{ __verify_paths }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+      register: __verify_path_stats
+
+    - name: Assert owner, group and mode of the role-managed paths
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['pw_name'] == item['item']['owner']
+          - item['stat']['gr_name'] == item['item']['group']
+          - item['stat']['mode'] == item['item']['mode']
+        fail_msg: >-
+          {{ item['item']['path'] }}: expected
+          {{ item['item']['owner'] }}:{{ item['item']['group'] }} {{ item['item']['mode'] }},
+          got {{ item['stat']['pw_name'] | default('-') }}:{{ item['stat']['gr_name'] | default('-') }}
+          {{ item['stat']['mode'] | default('-') }}
+        success_msg: "{{ item['item']['path'] }} is {{ item['item']['owner'] }}:{{ item['item']['group'] }} {{ item['item']['mode'] }}"
+      loop: "{{ __verify_path_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item']['path'] }}"
+
+    - name: Stat the paths that a config-only run must not create
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ __verify_absent_paths }}"
+      register: __verify_absent_stats
+
+    - name: Assert no restart marker, trust store anchor or plugin directory
+      ansible.builtin.assert:
+        that:
+          - not item['stat']['exists']
+        fail_msg: "{{ item['item'] }} exists after a config-only run"
+        success_msg: "{{ item['item'] }} is absent"
+      loop: "{{ __verify_absent_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+- name: Render - explicit retry_join addresses
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with openbao_raft_retry_join_api_addrs
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_retry_join_api_addrs:
+          - "https://127.0.0.1:8200"
+          - "https://bao-b.example:8200"
+          - "https://bao-c.example:8200"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the explicit addresses are rendered verbatim minus self
+      ansible.builtin.assert:
+        that:
+          - __verify_leaders == ['https://bao-b.example:8200', 'https://bao-c.example:8200']
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: retry_join uses the explicit addresses without this node
+
+- name: Render - TLS 1.2 only, client certificates requested
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with TLS 1.2 as minimum and maximum and client certificates
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_tls_min_version: tls12
+        openbao_tls_max_version: tls12
+        openbao_tls_disable_client_certs: false
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the cipher suites are rendered
+      ansible.builtin.assert:
+        that:
+          - "'tls_min_version = \"tls12\"' in __verify_hcl_n"
+          - "'tls_max_version = \"tls12\"' in __verify_hcl_n"
+          - "'tls_cipher_suites = \"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305\"' in __verify_hcl_n"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: TLS 1.2 cipher suites are rendered
+
+    - name: Assert retry_join presents the node certificate when client certificates are on
+      ansible.builtin.assert:
+        that:
+          - "'tls_disable_client_certs = false' in __verify_hcl_n"
+          - "__verify_hcl_n.count('leader_client_cert_file = \"/opt/openbao/tls/openbao-cert.pem\"') == 2"
+          - "__verify_hcl_n.count('leader_client_key_file = \"/opt/openbao/tls/openbao-key.pem\"') == 2"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: retry_join carries the client certificate and key
+
+- name: Render - TLS disabled
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with TLS disabled
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "http://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_tls_enabled: false
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert tls_disable and plain http retry_join without leader TLS
+      ansible.builtin.assert:
+        that:
+          - "'tls_disable = true' in __verify_hcl_n"
+          - "'tls_cert_file' not in __verify_hcl"
+          - "'tls_min_version' not in __verify_hcl"
+          - __verify_leaders == ['http://openbao-node-2:8200', 'http://openbao-node-3:8200']
+          - "'leader_tls_servername' not in __verify_hcl"
+          - "'leader_ca_cert_file' not in __verify_hcl"
+          - "'api_addr = \"http://127.0.0.1:8200\"' in __verify_hcl_n"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: TLS is disabled explicitly (no ACME fallback)
+
+- name: Render - transit seal with a tricky token
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # A double quote, a backslash, a dollar sign, a backtick, a hash and two
+    # spaces: everything the systemd EnvironmentFile quoting must handle.
+    __verify_tricky_token: 's.ab"c\d$e`f #g  h'
+    # The exact line openbao.env must contain for that token.
+    __verify_tricky_env_line: 'BAO_TOKEN="s.ab\"c\\d\$e\`f #g  h"'
+  tasks:
+    - name: Include the role with the transit seal
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: transit
+        openbao_seal_transit_address: "https://unsealer.example:8200"
+        openbao_seal_transit_namespace: render-ns
+        openbao_seal_transit_tls_ca_cert: /etc/ssl/certs/unsealer-ca.pem
+        openbao_seal_transit_token: "{{ __verify_tricky_token }}"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the transit stanza without the token
+      ansible.builtin.assert:
+        that:
+          - "'seal \"transit\" {' in __verify_hcl"
+          - "'address = \"https://unsealer.example:8200\"' in __verify_hcl_n"
+          - "'key_name = \"autounseal\"' in __verify_hcl_n"
+          - "'mount_path = \"transit/\"' in __verify_hcl_n"
+          - "'namespace = \"render-ns\"' in __verify_hcl_n"
+          - "'tls_ca_cert = \"/etc/ssl/certs/unsealer-ca.pem\"' in __verify_hcl_n"
+          - "'disable_renewal = \"false\"' in __verify_hcl_n"
+          - "'token' not in __verify_hcl"
+          - __verify_tricky_token not in __verify_hcl
+          - "'s.ab' not in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: transit stanza is rendered without the token
+
+    - name: Assert the escaped token line in openbao.env
+      ansible.builtin.assert:
+        that:
+          - __verify_tricky_env_line in __verify_env_lines
+        fail_msg: "{{ __verify_env_lines }}"
+        success_msg: openbao.env carries the escaped token
+
+    # systemd parses the file exactly as it will for openbao.service.
+    - name: Read BAO_TOKEN through the systemd EnvironmentFile parser
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --wait
+          - --pipe
+          - --quiet
+          - -p
+          - EnvironmentFile=/etc/openbao/openbao.env
+          - /usr/bin/printenv
+          - BAO_TOKEN
+      register: __verify_printenv
+      changed_when: false
+
+    - name: Assert systemd reads the token unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_printenv['stdout'] == __verify_tricky_token
+        fail_msg: "systemd read '{{ __verify_printenv['stdout'] }}', expected '{{ __verify_tricky_token }}'"
+        success_msg: systemd reads the tricky token intact
+
+- name: Render - static seal
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # 32 bytes as 64 hex characters.
+    __verify_static_key: "{{ '0123456789abcdef' * 4 }}"
+  tasks:
+    - name: Include the role with the static seal
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: static
+        openbao_seal_static_current_key_id: render-1
+        openbao_seal_static_current_key: "{{ __verify_static_key }}"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the static stanza references the key through env://
+      ansible.builtin.assert:
+        that:
+          - "'seal \"static\" {' in __verify_hcl"
+          - "'current_key_id = \"render-1\"' in __verify_hcl_n"
+          - "'current_key = \"env://OPENBAO_SEAL_STATIC_CURRENT_KEY\"' in __verify_hcl_n"
+          - __verify_static_key not in __verify_hcl
+          - "'seal \"transit\"' not in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: static stanza is rendered without the key
+
+    - name: Assert the key is only in openbao.env
+      ansible.builtin.assert:
+        that:
+          - ('OPENBAO_SEAL_STATIC_CURRENT_KEY="' ~ __verify_static_key ~ '"') in __verify_env_lines
+          - __verify_env_lines | select('match', 'BAO_TOKEN=') | list | length == 0
+        fail_msg: "{{ __verify_env_lines }}"
+        success_msg: openbao.env carries the static key
+
+- name: Render - awskms seal without a plugin checksum
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the awskms seal and static credentials
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: awskms
+        openbao_seal_awskms_kms_key_id: alias/openbao-render
+        openbao_seal_awskms_access_key: AKIARENDERTEST000001
+        openbao_seal_awskms_secret_key: render/secret+key=
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the plugin and seal stanzas without credentials
+      ansible.builtin.assert:
+        that:
+          - "'plugin_directory = \"/opt/openbao/plugins\"' in __verify_hcl_n"
+          - "'plugin \"kms\" \"awskms\" {' in __verify_hcl"
+          - "'command = \"openbao-plugin-kms-aws_0.1.1\"' in __verify_hcl_n"
+          - "'sha256sum' not in __verify_hcl"
+          - "'seal \"awskms\" {' in __verify_hcl"
+          - "'region = \"us-east-1\"' in __verify_hcl_n"
+          - "'kms_key_id = \"alias/openbao-render\"' in __verify_hcl_n"
+          - "'AKIARENDERTEST000001' not in __verify_hcl"
+          - "'render/secret+key=' not in __verify_hcl"
+          - "'seal \"static\"' not in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: awskms plugin and seal stanzas are rendered
+
+    - name: Assert the AWS credentials are only in openbao.env
+      ansible.builtin.assert:
+        that:
+          - "'AWS_ACCESS_KEY_ID=\"AKIARENDERTEST000001\"' in __verify_env_lines"
+          - "'AWS_SECRET_ACCESS_KEY=\"render/secret+key=\"' in __verify_env_lines"
+          - "'OPENBAO_SEAL_STATIC_CURRENT_KEY' not in __verify_env"
+        fail_msg: "{{ __verify_env_lines }}"
+        success_msg: openbao.env carries the AWS credentials
+
+    - name: Stat the plugin directory
+      ansible.builtin.stat:
+        path: /opt/openbao/plugins
+      register: __verify_plugin_dir
+
+    - name: Assert the plugin directory is owned by the service user
+      ansible.builtin.assert:
+        that:
+          - __verify_plugin_dir['stat']['isdir'] | default(false)
+          - __verify_plugin_dir['stat']['pw_name'] == 'openbao'
+          - __verify_plugin_dir['stat']['gr_name'] == 'openbao'
+          - __verify_plugin_dir['stat']['mode'] == '0750'
+        fail_msg: "{{ __verify_plugin_dir['stat'] | to_json }}"
+        success_msg: /opt/openbao/plugins is openbao:openbao 0750
+
+- name: Render - awskms seal with a plugin checksum
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the awskms seal, instance role and a pinned plugin checksum
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: awskms
+        openbao_seal_awskms_kms_key_id: alias/openbao-render
+        openbao_seal_plugin_checksum: 0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert sha256sum in the plugin stanza and no credentials in env
+      ansible.builtin.assert:
+        that:
+          - "'command = \"openbao-plugin-kms-aws_0.1.1\"' in __verify_hcl_n"
+          - "'sha256sum = \"0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76\"' in __verify_hcl_n"
+          - "'AWS_' not in __verify_env"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: plugin checksum is rendered, the instance role needs no env
+
+- name: Render - azurekeyvault seal
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the azurekeyvault seal and a client secret
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: azurekeyvault
+        openbao_seal_azurekeyvault_tenant_id: 00000000-0000-0000-0000-00000000000a
+        openbao_seal_azurekeyvault_vault_name: render-kv
+        openbao_seal_azurekeyvault_key_name: render-key
+        openbao_seal_azurekeyvault_client_id: 00000000-0000-0000-0000-00000000000b
+        openbao_seal_azurekeyvault_client_secret: render~client.secret
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the azure plugin and seal stanzas without the client secret
+      ansible.builtin.assert:
+        that:
+          - "'plugin \"kms\" \"azurekeyvault\" {' in __verify_hcl"
+          - "'command = \"openbao-plugin-kms-azure_0.1.1\"' in __verify_hcl_n"
+          - "'seal \"azurekeyvault\" {' in __verify_hcl"
+          - "'tenant_id = \"00000000-0000-0000-0000-00000000000a\"' in __verify_hcl_n"
+          - "'vault_name = \"render-kv\"' in __verify_hcl_n"
+          - "'key_name = \"render-key\"' in __verify_hcl_n"
+          - "'client_id = \"00000000-0000-0000-0000-00000000000b\"' in __verify_hcl_n"
+          - "'render~client.secret' not in __verify_hcl"
+          - "'AZURE_CLIENT_SECRET=\"render~client.secret\"' in __verify_env_lines"
+          - "'AWS_' not in __verify_env"
+        fail_msg: "{{ __verify_hcl }}{{ __verify_env }}"
+        success_msg: azurekeyvault stanzas are rendered, the secret is only in env
+
+- name: Render - gcpckms seal
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the gcpckms seal and a credentials file
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_seal_type: gcpckms
+        openbao_seal_gcpckms_project: render-project
+        openbao_seal_gcpckms_region: global
+        openbao_seal_gcpckms_key_ring: render-ring
+        openbao_seal_gcpckms_crypto_key: render-key
+        openbao_seal_gcpckms_credentials: /etc/openbao/gcp-credentials.json
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the gcp plugin and seal stanzas
+      ansible.builtin.assert:
+        that:
+          - "'plugin \"kms\" \"gcpckms\" {' in __verify_hcl"
+          - "'command = \"openbao-plugin-kms-gcp_0.1.1\"' in __verify_hcl_n"
+          - "'seal \"gcpckms\" {' in __verify_hcl"
+          - "'project = \"render-project\"' in __verify_hcl_n"
+          - "'region = \"global\"' in __verify_hcl_n"
+          - "'key_ring = \"render-ring\"' in __verify_hcl_n"
+          - "'crypto_key = \"render-key\"' in __verify_hcl_n"
+          - "'credentials = \"/etc/openbao/gcp-credentials.json\"' in __verify_hcl_n"
+          - __verify_env_lines | reject('match', '#') | reject('equalto', '') | list == ['BAO_ENABLE_FILE_PERMISSIONS_CHECK="true"']
+        fail_msg: "{{ __verify_hcl }}{{ __verify_env }}"
+        success_msg: gcpckms stanzas are rendered, nothing seal-related in env
+
+- name: Render - back to Shamir
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the converge vars only
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the seal and plugin stanzas and the seal env lines are gone
+      ansible.builtin.assert:
+        that:
+          - "'seal \"' not in __verify_hcl"
+          - "'plugin_directory' not in __verify_hcl"
+          - "'plugin \"kms\"' not in __verify_hcl"
+          - __verify_env_lines | reject('match', '#') | reject('equalto', '') | list == ['BAO_ENABLE_FILE_PERMISSIONS_CHECK="true"']
+        fail_msg: "{{ __verify_hcl }}{{ __verify_env }}"
+        success_msg: back to Shamir without seal or plugin stanzas
+
+- name: Render - audit disabled
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include the role with the audit device disabled
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_audit_enabled: false
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert markers without a device, no logrotate rule, no audit write path
+      ansible.builtin.assert:
+        that:
+          - "'# BEGIN ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
+          - "'# END ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
+          - "'audit \"' not in __verify_hcl"
+          - not __verify_logrotate['stat']['exists']
+          - "'ReadWritePaths=/opt/openbao/data' in __verify_unit_lines"
+        fail_msg: "{{ __verify_hcl }}{{ __verify_unit }}"
+        success_msg: audit device, logrotate rule and audit write path are removed
+
+- name: Render - hardening off, privileged API port
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Directive prefixes of the [H] set (spec section 7.4).
+    __verify_hardening_names:
+      - ProtectSystem=strict
+      - ReadWritePaths=
+      - ProtectKernelTunables=
+      - ProtectKernelModules=
+      - ProtectKernelLogs=
+      - ProtectControlGroups=
+      - ProtectClock=
+      - ProtectHostname=
+      - RestrictSUIDSGID=
+      - RestrictRealtime=
+      - RestrictNamespaces=
+      - LockPersonality=
+      - RestrictAddressFamilies=
+      - SystemCallArchitectures=
+      - UMask=
+  tasks:
+    - name: Include the role without hardening and with the API on port 443
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:443"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_listen_address: "0.0.0.0:443"
+        openbao_systemd_hardening: false
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert ProtectSystem=full, no [H] directive, upstream base kept
+      ansible.builtin.assert:
+        that:
+          - "'ProtectSystem=full' in __verify_unit_lines"
+          - __verify_hardening_names | select('in', __verify_unit) | list | length == 0
+          - "'MemorySwapMax=0' in __verify_unit_lines"
+          - "'NoNewPrivileges=yes' in __verify_unit_lines"
+          - "'PrivateTmp=yes' in __verify_unit_lines"
+          - "'PrivateDevices=yes' in __verify_unit_lines"
+          - "'ProtectHome=read-only' in __verify_unit_lines"
+          - "'LimitCORE=0' in __verify_unit_lines"
+        fail_msg: "{{ __verify_unit }}"
+        success_msg: hardening off keeps only the upstream sandbox
+
+    - name: Assert the bind capability for the privileged port
+      ansible.builtin.assert:
+        that:
+          - "'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' in __verify_unit_lines"
+          - "'AmbientCapabilities=CAP_NET_BIND_SERVICE' in __verify_unit_lines"
+          - "'address = \"0.0.0.0:443\"' in __verify_hcl_n"
+          - __verify_leaders == ['https://openbao-node-2:443', 'https://openbao-node-3:443']
+        fail_msg: "{{ __verify_unit }}{{ __verify_hcl }}"
+        success_msg: CAP_NET_BIND_SERVICE is granted for port 443
+
+- name: Render - extra dicts and raw HCL
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Raw HCL appended after the audit block.
+    __verify_extra_hcl: |
+      enable_response_header_hostname = true
+      enable_response_header_raft_node_id = true
+  tasks:
+    - name: Include the role with listener and raft extras and raw HCL
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_cluster_name: render-cluster
+        openbao_listener_extra_parameters:
+          tls_auto_reload: true
+          max_request_size: 33554432
+          max_request_duration: "90s"
+          x_forwarded_for_authorized_addrs:
+            - 10.0.0.0/8
+            - 192.168.0.0/16
+        openbao_raft_extra_parameters:
+          retry_join_as_non_voter: false
+          trailing_logs: 20000
+          snapshot_interval: "60s"
+        openbao_audit_options:
+          hmac_accessor: false
+          elide_list_responses: "true"
+        openbao_extra_config_hcl: "{{ __verify_extra_hcl }}"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert bool, number, string and list values inside their stanzas
+      ansible.builtin.assert:
+        that:
+          - "'cluster_name = \"render-cluster\"' in __verify_hcl_n"
+          - "'tls_auto_reload = true' in __verify_hcl_n"
+          - "'max_request_size = 33554432' in __verify_hcl_n"
+          - "'max_request_duration = \"90s\"' in __verify_hcl_n"
+          - "'x_forwarded_for_authorized_addrs = [\"10.0.0.0/8\", \"192.168.0.0/16\"]' in __verify_hcl_n"
+          - "'retry_join_as_non_voter = false' in __verify_hcl_n"
+          - "'trailing_logs = 20000' in __verify_hcl_n"
+          - "'snapshot_interval = \"60s\"' in __verify_hcl_n"
+          - "'elide_list_responses = \"true\"' in __verify_audit_n"
+          - "'hmac_accessor = \"false\"' in __verify_audit_n"
+          - "__verify_hcl.index('storage \"raft\" {') < __verify_hcl.index('trailing_logs') < __verify_hcl.index('listener \"tcp\" {')"
+          - "__verify_hcl_n.index('listener \"tcp\" {') < __verify_hcl_n.index('tls_auto_reload') < __verify_hcl_n.index('cluster_addr = \"')"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: extra parameters are rendered with their types
+
+    - name: Assert the raw HCL follows the closed audit block
+      ansible.builtin.assert:
+        that:
+          - "'# END ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
+          - __verify_extra_hcl in __verify_hcl
+          - __verify_hcl.index(__verify_extra_hcl) > __verify_hcl.index('# END ANSIBLE MANAGED AUDIT DEVICE')
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: raw HCL is appended verbatim after the audit block
+
+- name: Render - BYO TLS permissions are enforced
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Loosen the BYO key the way a careless copy would
+      ansible.builtin.file:
+        path: /opt/openbao/tls/openbao-key.pem
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Include the role with the converge vars
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+
+    - name: Stat the BYO key
+      ansible.builtin.stat:
+        path: /opt/openbao/tls/openbao-key.pem
+      register: __verify_byo_key
+
+    - name: Assert the role restored root:openbao 0640 on the key
+      ansible.builtin.assert:
+        that:
+          - __verify_byo_key['stat']['pw_name'] == 'root'
+          - __verify_byo_key['stat']['gr_name'] == 'openbao'
+          - __verify_byo_key['stat']['mode'] == '0640'
+        fail_msg: "{{ __verify_byo_key['stat'] | to_json }}"
+        success_msg: BYO key is root:openbao 0640 again
 
 - name: Negative - no password file
   hosts: all
@@ -316,4 +1196,36 @@
           ansible.builtin.assert:
             that:
               - "'Cluster members are missing from this play.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - BYO TLS file missing
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with a BYO certificate path that does not exist
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_config_only: true
+            openbao_raft_peers:
+              - openbao-render
+              - openbao-node-2
+              - openbao-node-3
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_tls_cert_file: /opt/openbao/tls/missing-cert.pem
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'BYO TLS file not found.' in ansible_failed_result['msg']"
+              - "'openbao_tls_cert_file' in ansible_failed_result['msg']"
+              - "'openbao_tls_key_file' not in ansible_failed_result['msg']"
             fail_msg: "{{ ansible_failed_result['msg'] }}"

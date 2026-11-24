@@ -1,0 +1,15 @@
+# Managed by Ansible - do not edit manually.
+# Changes to this file will be overwritten on the next playbook run.
+# OpenBao file audit log. No 'su' line: the audit directory is not group
+# writable, so root may rotate it; SIGHUP makes the device reopen its file.
+{{ openbao_audit_file_path }} {
+    daily
+    rotate {{ openbao_audit_logrotate_rotate }}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    postrotate
+        /bin/systemctl reload openbao.service > /dev/null 2>&1 || true
+    endscript
+}
