@@ -171,17 +171,28 @@ keyed by `openbao_arch` (see
 
 ### Invalid openbao_raft_peers.
 
-**Symptom:** the run stops in "Validate openbao_raft_peers" on every host.
+**Symptom:** the run stops in "Validate openbao_raft_peers" on every host
+that runs the role; the message names the play hosts outside the list.
 
-**Cause:** the peer list is empty, does not contain this host, or has one
-entry while the play has several hosts. The last case is the usual one: the
-inventory group is not named `openbao`, so the default falls back to
-`[inventory_hostname]` on each host and every host would initialize its own
-one-node cluster.
+**Cause:** the peer list is empty, does not contain this host, or the play
+has hosts that are not in it. The cluster-wide tasks aggregate the facts of
+all play hosts and store the init output, load the unseal keys and order the
+rolling restart from `run_once` tasks, so the play must hold one cluster and
+nothing else. Typical cases:
+
+- the inventory group is not named `openbao`, so the default falls back to
+  `[inventory_hostname]` on each host and every host would initialize its own
+  one-node cluster;
+- two clusters in one play (`hosts: dc1:dc2`, peers set per group): the
+  second cluster would never be initialized or would get the first cluster's
+  keys and quorum checks;
+- `hosts: all` with a `when` on the role: the hosts that skip the role are
+  still play hosts.
 
 **Fix:** name the inventory group `openbao`, or set `openbao_raft_peers` to the
-inventory names of all members. Run independent single nodes in separate
-plays.
+inventory names of all members, and target exactly that group:
+`hosts: <the cluster group>`. Run each cluster, and each independent single
+node, in its own play.
 
 ### openbao_init_bootstrap_node is not a cluster member.
 
@@ -695,23 +706,58 @@ whitespace-normalized blocks and sees only the hosts in the play.
 
 **Fix:** change the device in two runs against the whole cluster:
 
-1. Run with `openbao_audit_enabled: false`. The rolling restart applies it, and
-   the node that becomes active removes the device (its HMAC salt is lost).
-   The unit keeps `openbao_audit_dir` writable meanwhile, because every node
-   still opens the stored device when it unseals. A reload (SIGHUP) of the
-   active node, for example the nightly logrotate, can remove the device
-   before the restart reaches it.
+1. Run with `openbao_audit_enabled: false` and every other audit setting,
+   `openbao_audit_dir` included, still at the old values. The rolling restart
+   applies it, and the node that becomes active removes the device (its HMAC
+   salt is lost). The unit keeps `openbao_audit_dir` writable meanwhile,
+   because every node still opens the stored device when it unseals; a new
+   directory in the same run is refused
+   ([Audit directory change refused.](#audit-directory-change-refused)). A
+   reload (SIGHUP) of the active node, for example the nightly logrotate, can
+   remove the device before the restart reaches it.
 2. Confirm the device is gone before going on: `bao audit list` (with a token)
    must no longer list `file/` (with no device left it prints
    `No audit devices are enabled.`). The removal happens only when a node with the new config became active, so if
    step 1 failed before the leader was restarted, the old device still exists
    and step 3 would hit exactly the error the guard prevents. Re-run step 1
    until it completes.
-3. Run with `openbao_audit_enabled: true` and the new values. This creates a
-   new device with a new HMAC salt.
+3. Run with `openbao_audit_enabled: true` and the new values, a new
+   `openbao_audit_dir` included. This creates a new device with a new HMAC
+   salt.
 
 A second device declared through `openbao_extra_config_hcl` is immutable in
 the same way but not covered by the guard.
+
+### Audit directory change refused.
+
+**Symptom:** the run stops in "Refuse an audit directory change while the
+device is declared" before anything is rendered; the message names the file
+of the declared device and the new `openbao_audit_dir`.
+
+**Cause:** the existing `openbao.hcl` of a play host still declares the
+role's audit device, and its file is outside the new `openbao_audit_dir`.
+This includes a run that sets `openbao_audit_enabled: false` and moves the
+directory at the same time. The audit table is replicated, and every node
+opens each stored device when it unseals, before it removes the devices no
+longer declared in `openbao.hcl`. The unit keeps only `openbao_audit_dir`
+writable (`ProtectSystem=strict`), so with the new unit every restarted node
+would fail its post-unseal setup on the old file
+([No active node after an audit change](#no-active-node-after-an-audit-change)).
+
+**Fix:** move the directory in two runs against the whole cluster:
+
+1. Run with `openbao_audit_enabled: false` and `openbao_audit_dir` (and
+   `openbao_audit_file_path`) at the old values, and confirm with
+   `bao audit list` that the device is gone (steps 1 and 2 of
+   [Audit devices cannot be modified in place.](#audit-devices-cannot-be-modified-in-place)).
+2. Run with the new `openbao_audit_dir` and `openbao_audit_enabled: true`.
+   This creates a new device with a new HMAC salt; the old directory is left
+   in place.
+
+The guard reads the device from the `openbao.hcl` files of the play hosts, not
+from the audit table. If step 1 stopped before a node with the new config
+became active, the files no longer declare the device but the table still
+holds it; finish step 1 (`bao audit list`) before step 2.
 
 ### Seal migration
 
@@ -1109,12 +1155,17 @@ device when it unseals, before it removes the devices no longer declared in
 path outside `openbao_audit_dir`, which `ProtectSystem=strict` keeps
 read-only, a directory that does not exist on this node, wrong owner), no
 node can finish its post-unseal setup. The role keeps `openbao_audit_dir`
-writable whether or not `openbao_audit_enabled` is set, so its own device
-cannot cause this; a second device in `openbao_extra_config_hcl` or one
-enabled by hand can.
+writable whether or not `openbao_audit_enabled` is set, and refuses to move it
+while an `openbao.hcl` still declares its device
+([Audit directory change refused.](#audit-directory-change-refused)). Its own
+device can still cause this when `openbao_audit_dir` moved after a disable run
+that stopped before a node with the new config became active (the files no
+longer declared the device, the table still held it); a second device in
+`openbao_extra_config_hcl` or one enabled by hand can cause it at any time.
 
 **Fix:** make the file writable again on every node: put it back under
-`openbao_audit_dir` (or create the missing directory with owner
+`openbao_audit_dir` (for the role's own device, set `openbao_audit_dir` back to
+the old directory; or create the missing directory with owner
 `openbao`), then re-render and restart. A normal run stops at the leader wait
 before its rolling restart, so run only the stages that apply it:
 `--tags config,restart` (with `roles:` or `import_role`). Once a node is

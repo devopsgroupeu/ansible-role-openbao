@@ -76,7 +76,8 @@ flowchart TD
 
 `tasks/main.yml` only orchestrates. Every stage is its own task file with its
 own tag; the whole cluster group runs in one play with the default linear
-strategy and no `serial` (`facts.yml` refuses both). The rolling behaviour is
+strategy and no `serial` (`facts.yml` refuses both), and the play holds only
+that cluster's members (`validate.yml` rule 12). The rolling behaviour is
 inside the role. The API stages (7 and 8) aggregate over the started members
 only: a member with `openbao_service_state: stopped` is neither probed nor
 restarted, counts as missing for init, and fails the quorum check of every
@@ -107,7 +108,7 @@ sequenceDiagram
     C->>O: same, restart marker written when the software changed
 
     Note over C,O: 4. config.yml (all nodes)
-    C->>B: guards: foreign data dir, raft node id, seal type and key, audit device (cluster-wide)
+    C->>B: guards: foreign data dir, raft node id, seal type and key, audit directory, audit device (cluster-wide)
     C->>B: compare the three files in check mode, restart marker when one would change
     C->>B: render openbao.env, openbao.hcl (validate-config), openbao.service
     C->>O: same

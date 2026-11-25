@@ -55,7 +55,7 @@ Path variables must be the same on every node of a cluster (see [Notes](#notes))
 | `openbao_config_dir` | `"/etc/openbao"` | Holds `openbao.hcl` (`openbao:openbao 0640`), `openbao.env` (`root:root 0600`) and the restart marker `.ansible-restart-pending`. The directory itself is `root:openbao 0750`. |
 | `openbao_data_dir` | `"/opt/openbao/data"` | Raft data directory (`openbao:openbao 0750`, writable through `ReadWritePaths`). The guards treat a node with `vault.db` here as a node with data, and refuse a directory that holds other files but no `vault.db` (another storage backend, such as the `pebbledb` store of the package's own config, which uses the same default path; `lost+found` is ignored). |
 | `openbao_tls_dir` | `"/opt/openbao/tls"` | TLS material (`root:openbao 0750`). The package's own `tls.crt` / `tls.key` pair in the default directory is left in place and unused. |
-| `openbao_audit_dir` | `"/opt/openbao/audit"` | Audit log directory (`openbao:openbao 0750`), created on every node before the first start. `openbao_audit_file_path` must be inside it. |
+| `openbao_audit_dir` | `"/opt/openbao/audit"` | Audit log directory (`openbao:openbao 0750`), created on every node before the first start. `openbao_audit_file_path` must be inside it. Move it only after the device was removed: while an existing `openbao.hcl` of a play host declares the device outside the new directory, the role refuses, also with `openbao_audit_enabled: false` (every node still opens the stored device at unseal, and the unit keeps only this directory writable). |
 | `openbao_plugin_dir` | `"/opt/openbao/plugins"` | External plugin directory (`openbao:openbao 0750`, as the file permission check requires). Created and rendered as `plugin_directory` only for the cloud KMS seals; must not be a symbolic link. |
 | `openbao_user` | `"openbao"` | Service user. The package creates it; the binary method creates it as a system user (`/bin/false`, home `/opt/openbao`, no home directory created). |
 | `openbao_group` | `"openbao"` | Service group. |
@@ -105,7 +105,7 @@ Path variables must be the same on every node of a cluster (see [Notes](#notes))
 | Variable | Default | Description |
 |---|---|---|
 | `openbao_raft_node_id` | `"{{ inventory_hostname }}"` | Raft node id. Never use a random value: the role refuses to change it on a node that holds raft data. |
-| `openbao_raft_peers` | `"{{ groups['openbao'] \| default([inventory_hostname]) }}"` | Inventory names of all cluster members; each node gets one `retry_join` block per other member. With an inventory group not named `openbao` every host would fall back to a one-member cluster, which the role refuses when the play has several hosts. |
+| `openbao_raft_peers` | `"{{ groups['openbao'] \| default([inventory_hostname]) }}"` | Inventory names of all cluster members; each node gets one `retry_join` block per other member. Every play host must be in it: one cluster per play, and no other hosts (a second cluster or a host that skips the role through `when` is refused). With an inventory group not named `openbao` every host would fall back to a one-member cluster, which the same check refuses when the play has several hosts. |
 | `openbao_raft_retry_join_api_addrs` | `[]` | Explicit API URLs of all members, self included (the role drops its own URL from `retry_join`). Empty: each member's `openbao_api_addr`. Required for `--limit` day-2 runs; the quorum check before each restart then also covers the members outside the play. |
 | `openbao_raft_performance_multiplier` | `1` | Raft timing multiplier. `1` is the production value. |
 | `openbao_raft_extra_parameters` | `{}` | Extra keys for the `storage "raft"` stanza, rendered sorted (bool, number, string, or list of strings), for example `autopilot_reconcile_interval`. Not checked by `validate-config`, so typos pass silently. |
@@ -305,10 +305,13 @@ only for a listener port below 1024). No `LimitNOFILE`, `LimitMEMLOCK` or
   cross-variable rules, required inputs per seal, fail-closed preconditions),
   also under `--tags`. With `rolespec_validate: false` the `validate.yml`
   checks still apply.
-- **One linear play, no `serial`.** The whole cluster group runs in one play
-  with the default linear strategy; `tasks/facts.yml` refuses `serial` and
-  the free strategy, because the cluster checks read the other members' facts
-  and the rolling restart runs from `run_once` tasks.
+- **One linear play, no `serial`, members only.** The whole cluster group runs
+  in one play with the default linear strategy; `tasks/facts.yml` refuses
+  `serial` and the free strategy, because the cluster checks read the other
+  members' facts and the rolling restart runs from `run_once` tasks. For the
+  same reason every play host must be in `openbao_raft_peers`
+  (`tasks/validate.yml` rule 12): run each cluster in its own play
+  (`hosts: <its group>`), not `hosts: all` with a `when` on the role.
 - **A reload re-reads `openbao.hcl`.** On SIGHUP (the role's certificate
   reload, the nightly logrotate reload, `systemctl reload openbao`) OpenBao
   loads the config file again and applies the listener certificates, the log
@@ -345,7 +348,9 @@ only for a listener port below 1024). No `LimitNOFILE`, `LimitMEMLOCK` or
   device exists. The guard compares the device of every play host (old file and
   new settings, whitespace-normalized) and fails before rendering; it sees only
   the hosts in the play. Adding the device (no old stanza anywhere) and
-  removing it (`openbao_audit_enabled: false`) pass.
+  removing it (`openbao_audit_enabled: false`) pass. Remove it with
+  `openbao_audit_dir` unchanged: a second guard refuses to move the directory
+  away from a device that an existing `openbao.hcl` still declares.
 - **What `validate-config` does not check.** The `validate:` hook of
   `openbao.hcl` runs `bao operator validate-config`, which fails the render on
   unknown keys in the top level, listener, telemetry, audit and plugin blocks.

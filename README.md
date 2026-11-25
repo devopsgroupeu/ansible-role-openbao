@@ -146,9 +146,11 @@ See `examples/` for all complete playbooks.
   changed keeps a restart marker until it was restarted, so a re-run after a
   failure finishes the rolling restart. Nodes that already restarted are not
   restarted again.
-- **One play, linear, no `serial`:** the whole group runs in one play with the
-  default linear strategy; the role refuses `serial` and `strategy: free`
-  (the rolling behaviour is inside the role).
+- **One play, linear, no `serial`, members only:** the whole group runs in one
+  play with the default linear strategy; the role refuses `serial` and
+  `strategy: free` (the rolling behaviour is inside the role), and a play host
+  outside `openbao_raft_peers` (a second cluster, or `hosts: all` with a
+  `when` on the role). Run each cluster in its own play.
 - **`--limit`:** day-2 runs on part of the cluster need
   `openbao_raft_retry_join_api_addrs` with the API URLs of all members; the
   role refuses otherwise. Initialization always needs the whole group.
@@ -291,9 +293,13 @@ downloads are refused.
 The role declares the audit device in `openbao.hcl` (OpenBao blocks creating
 audit devices through the API). **Its settings cannot change in place**:
 OpenBao refuses a modified device when a node becomes active. The role refuses
-such a change before rendering; change it in two runs (disable, then re-enable
-with the new values) as described in
+such a change before rendering; change it in two runs (disable with the old
+values, `openbao_audit_dir` included, then re-enable with the new values) as
+described in
 [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#audit-devices-cannot-be-modified-in-place).
+Moving `openbao_audit_dir` in the disabling run is refused too
+([Audit directory change refused.](docs/TROUBLESHOOTING.md#audit-directory-change-refused)):
+every node still opens the stored device when it unseals.
 
 ### systemd hardening is role opinion
 
@@ -372,9 +378,9 @@ pip install -r requirements.txt
 molecule test -s render
 
 # Single node: signed package install, generated TLS, init, unseal, audit
-# off and on again, check mode, certificate and key rotation, maintenance
-# stop, --check and --tags through roles:, in-place change guards, foreign
-# data directory, blank password file
+# off, moved and on again, check mode, certificate and key rotation,
+# maintenance stop, --check and --tags through roles:, in-place change guards,
+# foreign data directory, blank password file
 molecule test -s default
 
 # Single node: verified binary install, static auto-unseal, seal key guard,
@@ -385,7 +391,8 @@ molecule test -s autounseal
 
 # Three nodes: 2.7.2 to 2.7.3 rolling upgrade, quorum check, healing after a
 # failed run, one member in maintenance, serial and free strategy refused,
-# node replacement with remove-peer, inventory group guard
+# node replacement with remove-peer, inventory group guard, one cluster per
+# play
 molecule test -s raft-ha
 ```
 
