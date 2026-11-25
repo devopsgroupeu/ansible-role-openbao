@@ -2,8 +2,13 @@
 # Verify for the default scenario (spec section 12.2, List B).
 # The first play checks the converge result: package install with the pinned
 # version and hold, the verified signing key, generated TLS, owners and modes
-# of spec section 7.1, the hardened unit and the running, uninitialized
-# service.
+# of spec section 7.1, the hardened unit and the running, initialized and
+# unsealed service. The second play checks the encrypted init output on the
+# controller, the declarative audit device and that no secret leaks into
+# openbao.hcl or the journal, using the root token from the init file.
+# Then the root token is revoked and every later play runs the role without
+# it (Review Focus 2). Plays that re-include the role repeat the converge
+# vars (plays do not inherit them).
 
 - name: Verify install and service
   hosts: all
@@ -219,11 +224,280 @@
       retries: 12
       delay: 5
 
-    - name: Assert raft storage, the pinned version and an uninitialized node
+    - name: Assert raft storage, the pinned version and an initialized, unsealed Shamir node
       ansible.builtin.assert:
         that:
           - __verify_seal['json']['storage_type'] == 'raft'
           - __verify_seal['json']['version'] == '2.7.3'
-          - not __verify_seal['json']['initialized']
+          - __verify_seal['json']['initialized']
+          - not __verify_seal['json']['sealed']
+          - __verify_seal['json']['type'] == 'shamir'
         fail_msg: "{{ __verify_seal['json'] | to_json }}"
-        success_msg: node answers over TLS, raft storage, 2.7.3, not initialized
+        success_msg: node answers over TLS, raft storage, 2.7.3, initialized and unsealed with Shamir
+
+- name: Verify the init output, the audit device and secret handling
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_init_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+    __verify_vault_pass: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+    # CLI environment for the token-based checks (verify only; the role never
+    # sets BAO_TOKEN).
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Stat the controller init file
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+      register: __verify_init_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Assert the init file exists with mode 0600
+      ansible.builtin.assert:
+        that:
+          - __verify_init_stat['stat']['exists']
+          - __verify_init_stat['stat']['mode'] == '0600'
+        fail_msg: "{{ __verify_init_file }}: {{ __verify_init_stat['stat']['mode'] | default('missing') }}"
+        success_msg: the init file exists on the controller with mode 0600
+
+    - name: Read the raw init file
+      ansible.builtin.slurp:
+        src: "{{ __verify_init_file }}"
+      register: __verify_init_raw
+      delegate_to: localhost
+      become: false
+
+    - name: Assert the init file is Ansible Vault encrypted
+      ansible.builtin.assert:
+        that:
+          - (__verify_init_raw['content'] | b64decode).splitlines() | first == '$ANSIBLE_VAULT;1.2;AES256;filter_default'
+        fail_msg: the first line of {{ __verify_init_file }} is not the Ansible Vault 1.2 filter_default header
+        success_msg: the init file starts with $ANSIBLE_VAULT;1.2;AES256;filter_default
+
+    # The operator's way to read the file back.
+    - name: Decrypt the init file with ansible-vault
+      ansible.builtin.command:
+        argv:
+          - ansible-vault
+          - view
+          - --vault-password-file
+          - "{{ __verify_vault_pass }}"
+          - "{{ __verify_init_file }}"
+      register: __verify_init_view
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Parse the decrypted init output
+      ansible.builtin.set_fact:
+        __verify_init: "{{ __verify_init_view['stdout'] | from_json }}"
+      no_log: true
+
+    - name: Assert the init output holds a root token and one unseal key
+      ansible.builtin.assert:
+        that:
+          - __verify_init['root_token'] | default('') | length > 0
+          - __verify_init['unseal_keys_hex'] | default([], true) | length == 1
+        fail_msg: "init output keys: {{ __verify_init | list | to_json }}"
+        success_msg: the init output decrypts to JSON with a root token and one unseal key
+
+    - name: List the audit devices with the root token
+      ansible.builtin.command: bao audit list -format=json
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      register: __verify_audit_list
+      changed_when: false
+      no_log: true
+
+    - name: Assert the declarative file audit device is enabled
+      ansible.builtin.assert:
+        that:
+          - "'file/' in (__verify_audit_list['stdout'] | from_json)"
+        fail_msg: "{{ __verify_audit_list['stdout'] }}"
+        success_msg: audit device file/ is enabled
+
+    - name: List the raft peers with the root token
+      ansible.builtin.command: bao operator raft list-peers -format=json
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      register: __verify_raft_peers
+      changed_when: false
+      no_log: true
+
+    - name: Assert one raft voter
+      ansible.builtin.assert:
+        that:
+          - __verify_servers | length == 1
+          - __verify_servers | selectattr('voter') | list | length == 1
+        fail_msg: "{{ __verify_servers | to_json }}"
+        success_msg: raft has one peer and it is a voter
+      vars:
+        __verify_servers: "{{ (__verify_raft_peers['stdout'] | from_json)['data']['config']['servers'] }}"
+
+    # One more authenticated request, so the audit log has entries.
+    - name: Look up the root token
+      ansible.builtin.command: bao token lookup -format=json
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      changed_when: false
+      no_log: true
+
+    - name: Stat the audit log
+      ansible.builtin.stat:
+        path: /opt/openbao/audit/openbao_audit.log
+      register: __verify_audit_log
+
+    - name: Assert the audit log is written with mode 0600
+      ansible.builtin.assert:
+        that:
+          - __verify_audit_log['stat']['exists']
+          - __verify_audit_log['stat']['size'] > 0
+          - __verify_audit_log['stat']['mode'] == '0600'
+          - __verify_audit_log['stat']['pw_name'] == 'openbao'
+        fail_msg: "{{ __verify_audit_log['stat'] | to_json }}"
+        success_msg: the audit log exists, is non-empty and has mode 0600
+
+    - name: Read openbao.hcl for the secret check
+      ansible.builtin.slurp:
+        src: /etc/openbao/openbao.hcl
+      register: __verify_hcl_secret_raw
+
+    - name: Read the openbao journal
+      ansible.builtin.command: journalctl -u openbao --no-pager
+      register: __verify_journal
+      changed_when: false
+
+    - name: Assert neither the root token nor the unseal key appear in openbao.hcl or the journal
+      ansible.builtin.assert:
+        that:
+          - __verify_init['root_token'] not in __verify_hcl_text
+          - __verify_init['unseal_keys_hex'][0] not in __verify_hcl_text
+          - __verify_init['unseal_keys_b64'][0] not in __verify_hcl_text
+          - __verify_init['root_token'] not in __verify_journal['stdout']
+          - __verify_init['unseal_keys_hex'][0] not in __verify_journal['stdout']
+          - __verify_init['unseal_keys_b64'][0] not in __verify_journal['stdout']
+        fail_msg: a secret from the init output appears in openbao.hcl or in journalctl -u openbao
+        success_msg: no root token or unseal key in openbao.hcl or the journal
+      vars:
+        __verify_hcl_text: "{{ __verify_hcl_secret_raw['content'] | b64decode }}"
+
+# The docs tell operators to revoke the root token after bootstrap; the role
+# must keep converging, unsealing and restarting without it.
+- name: Revoke root token
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Revoke the root token
+      ansible.builtin.command: bao token revoke -self
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      changed_when: true
+      no_log: true
+
+    - name: Look up the revoked root token
+      ansible.builtin.command: bao token lookup
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      register: __verify_revoked_lookup
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Assert the root token no longer works
+      ansible.builtin.assert:
+        that:
+          - __verify_revoked_lookup['rc'] != 0
+        fail_msg: bao token lookup still succeeds with the root token
+        success_msg: the root token is revoked
+
+    - name: Include the role without a valid root token
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-default
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_peers:
+          - openbao-default
+        openbao_tls_install_ca_to_trust_store: false
+
+    - name: Read the seal status after the run
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_after_revoke
+
+    - name: Assert the node is still initialized and unsealed
+      ansible.builtin.assert:
+        that:
+          - __verify_seal_after_revoke['json']['initialized']
+          - not __verify_seal_after_revoke['json']['sealed']
+        fail_msg: "{{ __verify_seal_after_revoke['json'] | to_json }}"
+        success_msg: the role converged without the root token
+
+# A wrong or rotated Ansible Vault password must fail clearly in load_keys.yml
+# and change nothing on the node (Review Focus 4).
+- name: Negative - wrong vault password
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the wrong Ansible Vault password file
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/wrong-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-default
+            openbao_tls_install_ca_to_trust_store: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Could not decrypt the init file.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Assert openbao.hcl is unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+        fail_msg: openbao.hcl changed during the failed run
+        success_msg: openbao.hcl is byte-identical after the failed run

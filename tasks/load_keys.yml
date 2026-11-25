@@ -1,0 +1,82 @@
+---
+# ==============================================================================
+# Load the Shamir unseal keys from the controller init file (spec section
+# 5.7). Included from init_unseal.yml and restart.yml; safe to include more
+# than once in one run, because every fact below is set again on each
+# include. Only the unseal keys and the threshold are kept: the root token in
+# the same file is never put into a fact. Nothing is loaded for auto-unseal
+# seals or when openbao_unseal is false.
+# Produces (on every play host):
+#   __openbao_unseal_keys       hex unseal keys, [] when none are available
+#   __openbao_unseal_threshold  number of keys needed to unseal
+# ==============================================================================
+
+- name: Read the unseal keys from the controller init file
+  when:
+    - openbao_seal_type == 'shamir'
+    - openbao_unseal | bool
+  tags: [init_unseal, restart]
+  block:
+    - name: Stat the controller init file
+      ansible.builtin.stat:
+        path: "{{ openbao_init_output_path }}"
+      register: __openbao_init_file_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: [init_unseal, restart]
+
+    # Read, decrypt and parse in memory; nothing is written. A missing init
+    # file gives no keys (init_unseal.yml fails fast when a node needs them).
+    - name: Decrypt and parse the controller init file
+      tags: [init_unseal, restart]
+      block:
+        - name: Read the controller init file
+          ansible.builtin.slurp:
+            src: "{{ openbao_init_output_path }}"
+          register: __openbao_init_file_raw
+          delegate_to: localhost
+          become: false
+          run_once: true
+          no_log: true
+          when: __openbao_init_file_stat['stat']['exists']
+          tags: [init_unseal, restart]
+
+        - name: Extract the unseal keys from the init file
+          ansible.builtin.set_fact:
+            __openbao_init_file_keys: "{{ __openbao_init_json['unseal_keys_hex'] | default([], true) if __openbao_init_file_stat['stat']['exists'] else [] }}"
+            __openbao_init_file_threshold: "{{ __openbao_init_json['unseal_threshold'] | default(openbao_init_key_threshold, true) | int if __openbao_init_file_stat['stat']['exists'] else openbao_init_key_threshold | int }}"
+          vars:
+            __openbao_init_text: "{{ __openbao_init_file_raw['content'] | b64decode }}"
+            __openbao_init_json: >-
+              {{ (__openbao_init_text | ansible.builtin.unvault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file))
+                  if __openbao_init_text.startswith('$ANSIBLE_VAULT') else __openbao_init_text) | from_json }}
+          run_once: true
+          no_log: true
+          tags: [init_unseal, restart]
+      rescue:
+        - name: Fail because the init file could not be decrypted
+          ansible.builtin.fail:
+            msg: >-
+              Could not decrypt the init file.
+              Reading, decrypting or parsing {{ openbao_init_output_path }} on the
+              controller with the password in
+              {{ openbao_init_encrypt_password_file if openbao_init_encrypt_password_file | length > 0 else '(none: openbao_init_encrypt_password_file is empty)' }}
+              failed, so the unseal keys are not available. Nothing was changed by
+              this step. Point openbao_init_encrypt_password_file at the Ansible
+              Vault password file the init output was encrypted with (after a
+              password rotation, rekey the file with ansible-vault rekey), or point
+              openbao_init_output_path at the init file of this cluster.
+          run_once: true
+          tags: [init_unseal, restart]
+
+# The run_once tasks above ran on one host; publish their result to every
+# play host (H 4.7 step 4), so the per-host unseal tasks read their own facts.
+- name: Publish the unseal keys to every play host
+  ansible.builtin.set_fact:
+    __openbao_unseal_keys: "{{ hostvars[ansible_play_hosts[0]]['__openbao_init_file_keys'] if __openbao_load_keys else [] }}"
+    __openbao_unseal_threshold: "{{ hostvars[ansible_play_hosts[0]]['__openbao_init_file_threshold'] if __openbao_load_keys else openbao_init_key_threshold | int }}"
+  vars:
+    __openbao_load_keys: "{{ openbao_seal_type == 'shamir' and openbao_unseal | bool }}"
+  no_log: true
+  tags: [init_unseal, restart]

@@ -29,3 +29,11 @@
 - name: Flush handlers
   ansible.builtin.meta: flush_handlers
   when: not openbao_config_only | bool
+
+# A stopped service (maintenance) is neither initialized nor unsealed.
+- name: Initialize and unseal OpenBao
+  ansible.builtin.include_tasks: init_unseal.yml
+  when:
+    - not openbao_config_only | bool
+    - openbao_service_state == 'started'
+  tags: init_unseal

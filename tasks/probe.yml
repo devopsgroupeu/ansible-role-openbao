@@ -1,0 +1,57 @@
+---
+# ==============================================================================
+# Status probe (spec section 5.7), on every play host, through the
+# unauthenticated HTTP API (bao status returns rc 1 whenever sys/leader fails,
+# so the role does not use it). Included from init_unseal.yml and restart.yml;
+# safe to include more than once in one run, because every fact below is set
+# again on each include.
+# Produces:
+#   __openbao_seal_status          parsed sys/seal-status of this node
+#   __openbao_leader               parsed sys/leader, {} when sealed or failing
+#   __openbao_is_leader            this node is the active node
+#   __openbao_cluster_initialized  any play host reports initialized (same
+#                                  value on every host)
+# ==============================================================================
+
+# A node that does not answer fails the run: an unknown state never means
+# "not initialized" (fail closed). Init then refuses to run, because the
+# failed node is no longer in ansible_play_hosts.
+- name: Read the seal status
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/seal-status"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  register: __openbao_probe
+  until: __openbao_probe is succeeded
+  retries: 12
+  delay: 5
+  check_mode: false
+  tags: [init_unseal, restart]
+
+# sys/leader answers with an error on a sealed node.
+- name: Read the leader status
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/leader"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+  register: __openbao_leader_probe
+  failed_when: false
+  check_mode: false
+  when: not __openbao_probe['json']['sealed']
+  tags: [init_unseal, restart]
+
+# is_self and leader_address are omitempty in the API response.
+- name: Record the status of this node
+  ansible.builtin.set_fact:
+    __openbao_seal_status: "{{ __openbao_probe['json'] }}"
+    __openbao_leader: "{{ __openbao_leader_json }}"
+    __openbao_is_leader: "{{ __openbao_leader_json['is_self'] | default(false) | bool }}"
+  vars:
+    __openbao_leader_json: "{{ __openbao_leader_probe['json'] | default({}) if __openbao_leader_probe['status'] | default(0) == 200 else {} }}"
+  tags: [init_unseal, restart]
+
+- name: Record whether the cluster is initialized
+  ansible.builtin.set_fact:
+    __openbao_cluster_initialized: "{{ ansible_play_hosts | map('extract', hostvars, ['__openbao_seal_status', 'initialized']) | select | list | length > 0 }}"
+  tags: [init_unseal, restart]

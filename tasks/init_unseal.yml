@@ -1,0 +1,451 @@
+---
+# ==============================================================================
+# Init, encrypted persist, unseal and formation check (spec section 5.7).
+# Included by main.yml unless openbao_config_only, and only while
+# openbao_service_state is started. Cluster state comes from the
+# unauthenticated HTTP API (probe.yml); the CLI is used only for operator
+# init. The role never sets BAO_TOKEN and never reads the root token.
+# Check mode: init, persist and unseal are skipped; probes, waits and asserts
+# run read-only against the live cluster.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1-2. Probe every node; initialize only when every play host answered
+#      "not initialized" (an unreachable node already failed the probe).
+# ------------------------------------------------------------------------------
+
+- name: Probe the OpenBao nodes
+  ansible.builtin.include_tasks: probe.yml
+  tags: init_unseal
+
+- name: Decide whether to initialize the cluster
+  ansible.builtin.set_fact:
+    __openbao_do_init: "{{ openbao_init | bool and not __openbao_cluster_initialized and not ansible_check_mode }}"
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 3. Init preconditions (run_once). The output of operator init exists only
+#    once, so everything that could stop it from being stored is checked
+#    before init runs.
+# ------------------------------------------------------------------------------
+
+- name: Check the init preconditions
+  when: __openbao_do_init | bool
+  tags: init_unseal
+  block:
+    - name: Assert the whole cluster is in the play
+      ansible.builtin.assert:
+        that:
+          - openbao_raft_peers | difference(ansible_play_hosts) | length == 0
+        fail_msg: >-
+          Initialization needs the whole cluster in the play.
+          No play host reports initialized, but
+          {{ openbao_raft_peers | difference(ansible_play_hosts) | join(', ') }}
+          (members in openbao_raft_peers) are not in this play (play hosts:
+          {{ ansible_play_hosts | join(', ') }}). A member that failed earlier
+          in this run, for example because its API did not answer, counts as
+          missing. Run the role against all members, without --limit or
+          serial, so that no member could already be initialized.
+        quiet: true
+      run_once: true
+      tags: init_unseal
+
+    - name: Stat the Ansible Vault password file
+      ansible.builtin.stat:
+        path: "{{ openbao_init_encrypt_password_file }}"
+      register: __openbao_init_pass_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when:
+        - openbao_init_encrypt_output | bool
+        - openbao_init_encrypt_password_file | length > 0
+      tags: init_unseal
+
+    # Defence in depth behind validate.yml rule 26: the file must also exist,
+    # be readable and hold a password.
+    - name: Assert the Ansible Vault password file is usable
+      ansible.builtin.assert:
+        that:
+          - openbao_init_encrypt_password_file | length > 0
+          - __openbao_init_pass_stat['stat']['readable'] | default(false)
+          - __openbao_init_pass_stat['stat']['size'] | default(0) > 0
+        fail_msg: >-
+          Init output encryption requested but no password file set.
+          openbao_init_encrypt_password_file
+          ('{{ openbao_init_encrypt_password_file }}') is empty, or the file is
+          missing, unreadable or empty on the controller, so the init output
+          could not be encrypted. Nothing was initialized. Point it at a
+          controller-side Ansible Vault password file, or set
+          openbao_init_encrypt_output: false to accept a plain-text init file.
+        quiet: true
+      run_once: true
+      when: openbao_init_encrypt_output | bool
+      tags: init_unseal
+
+    - name: Stat the init output directory on the controller
+      ansible.builtin.stat:
+        path: "{{ openbao_init_output_path | dirname }}"
+      register: __openbao_init_dir_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: init_unseal
+
+    # Never chmod an existing directory: it may be shared (for example /tmp).
+    - name: Create the init output directory
+      ansible.builtin.file:
+        path: "{{ openbao_init_output_path | dirname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not __openbao_init_dir_stat['stat']['exists']
+      tags: init_unseal
+
+    - name: Stat the controller init file
+      ansible.builtin.stat:
+        path: "{{ openbao_init_output_path }}"
+      register: __openbao_init_prev_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: init_unseal
+
+    - name: Assert no previous init file exists
+      ansible.builtin.assert:
+        that:
+          - not __openbao_init_prev_stat['stat']['exists']
+        fail_msg: >-
+          A previous init file exists for this cluster id.
+          {{ openbao_init_output_path }} already exists on the controller, but no
+          node of cluster '{{ openbao_cluster_id }}' reports initialized. The
+          role never overwrites key material. Move the file away only if you are
+          sure the old cluster is gone, or fix openbao_cluster_id (or
+          openbao_init_output_path) for this cluster, then re-run.
+        quiet: true
+      run_once: true
+      tags: init_unseal
+
+    - name: Prove the init output directory is writable
+      tags: init_unseal
+      block:
+        - name: Create a scratch file in the init output directory
+          ansible.builtin.tempfile:
+            state: file
+            path: "{{ openbao_init_output_path | dirname }}"
+            prefix: .openbao-write-test.
+          register: __openbao_init_write_test
+          changed_when: false
+          delegate_to: localhost
+          become: false
+          run_once: true
+          tags: init_unseal
+      always:
+        - name: Remove the scratch file
+          ansible.builtin.file:
+            path: "{{ __openbao_init_write_test['path'] }}"
+            state: absent
+          changed_when: false
+          delegate_to: localhost
+          become: false
+          run_once: true
+          when: __openbao_init_write_test['path'] is defined
+          tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 4. operator init on the bootstrap node, in its own context (not delegate_to),
+#    so the node's own address facts apply. any_errors_fatal: a failed init
+#    stops every host, not only the bootstrap node. PGP keys are paths on the
+#    bootstrap node or keybase: names.
+# ------------------------------------------------------------------------------
+
+- name: Initialize the cluster on the bootstrap node
+  ansible.builtin.command:
+    argv: "{{ [openbao_bin_path, 'operator', 'init', '-format=json'] + __openbao_init_share_args + __openbao_init_pgp_args }}"
+  vars:
+    __openbao_init_share_args: >-
+      {{ ['-key-shares=' ~ openbao_init_key_shares, '-key-threshold=' ~ openbao_init_key_threshold]
+         if openbao_seal_type == 'shamir' else
+         ['-recovery-shares=' ~ openbao_init_recovery_shares, '-recovery-threshold=' ~ openbao_init_recovery_threshold] }}
+    __openbao_init_pgp_args: >-
+      {{ [] if openbao_init_pgp_keys | length == 0 else
+         [('-pgp-keys=' if openbao_seal_type == 'shamir' else '-recovery-pgp-keys=') ~ openbao_init_pgp_keys | join(',')] }}
+  environment: "{{ __openbao_cli_env }}"
+  register: __openbao_init_result
+  changed_when: true
+  no_log: true
+  any_errors_fatal: true
+  when:
+    - __openbao_do_init | bool
+    - inventory_hostname == openbao_init_bootstrap_node
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 5. Persist on the controller (run_once). The content is encrypted in memory
+#    before it touches disk; decrypt: false keeps copy from decrypting the
+#    vaulted text again.
+# ------------------------------------------------------------------------------
+
+- name: Store the init output on the controller
+  when: __openbao_do_init | bool
+  tags: init_unseal
+  block:
+    - name: Write the init output to the controller
+      ansible.builtin.copy:
+        content: "{{ __openbao_init_vaulted if openbao_init_encrypt_output | bool else __openbao_init_json }}"
+        dest: "{{ openbao_init_output_path }}"
+        mode: "0600"
+        decrypt: false
+      vars:
+        __openbao_init_json: "{{ hostvars[openbao_init_bootstrap_node]['__openbao_init_result']['stdout'] | from_json | to_nice_json }}"
+        __openbao_init_vaulted: "{{ __openbao_init_json | ansible.builtin.vault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file)) }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true
+      tags: init_unseal
+  rescue:
+    - name: Fail because the init output could not be stored
+      ansible.builtin.fail:
+        msg: >-
+          Init succeeded but the init output could not be stored.
+          {{ openbao_init_bootstrap_node }} was initialized, but writing the
+          root token and keys to {{ openbao_init_output_path }} on the
+          controller failed, so they are lost. The new cluster holds no data:
+          stop the openbao service, delete the contents of
+          {{ openbao_data_dir }} on all nodes, fix the cause (directory,
+          permissions, password file) and re-run.
+      run_once: true
+      tags: init_unseal
+
+# The first probe predates init: the bootstrap node is now initialized and
+# sealed.
+- name: Probe the OpenBao nodes again after init
+  ansible.builtin.include_tasks: probe.yml
+  when: __openbao_do_init | bool
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 6-7. Unseal keys and capability facts (same values on every host).
+# ------------------------------------------------------------------------------
+
+- name: Load the unseal keys
+  ansible.builtin.include_tasks: load_keys.yml
+  tags: init_unseal
+
+# __openbao_expect_unsealed: the role waits for unsealed nodes and checks the
+# leader. Not in check mode while a node is sealed, because nothing unseals it.
+- name: Record what the role can do about sealed nodes
+  ansible.builtin.set_fact:
+    __openbao_can_unseal: "{{ __openbao_can_unseal_now }}"
+    __openbao_sealed_hosts: "{{ __openbao_sealed_now }}"
+    __openbao_any_sealed: "{{ __openbao_sealed_now | length > 0 }}"
+    __openbao_do_unseal: "{{ openbao_seal_type == 'shamir' and __openbao_can_unseal_now and __openbao_cluster_initialized and not ansible_check_mode }}"
+    __openbao_expect_unsealed: "{{ __openbao_cluster_initialized and __openbao_can_unseal_now and not (ansible_check_mode and __openbao_sealed_now | length > 0) }}"
+  vars:
+    __openbao_can_unseal_now: "{{ openbao_seal_type != 'shamir' or (openbao_unseal | bool and __openbao_unseal_keys | length > 0) }}"
+    __openbao_sealed_now: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('__openbao_seal_status.sealed') | map(attribute='inventory_hostname') | list }}"
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 8. Fail fast: an initialized cluster with sealed nodes and no keys.
+# ------------------------------------------------------------------------------
+
+- name: Assert unseal keys are available for the sealed nodes
+  ansible.builtin.assert:
+    that:
+      - not (openbao_seal_type == 'shamir' and openbao_unseal | bool and __openbao_unseal_keys | length == 0 and __openbao_any_sealed)
+    fail_msg: >-
+      No init file was found for an initialized, sealed cluster.
+      The cluster is initialized and {{ __openbao_sealed_hosts | join(', ') }}
+      are sealed, but no unseal keys were found in
+      {{ openbao_init_output_path }} on the controller. Set
+      openbao_init_output_path or openbao_cluster_id to the init file of this
+      cluster, or set openbao_unseal: false and unseal by hand.
+    quiet: true
+  run_once: true
+  when: __openbao_cluster_initialized | bool
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 9. Unseal (Shamir), ordered for the linear strategy: the bootstrap node
+#    first (after a fresh init the others can only join an unsealed leader),
+#    then the other initialized nodes, then the nodes that join through
+#    retry_join. Every unseal is gated on initialized and sealed, so re-runs
+#    skip. Loop labels show the key index only.
+# ------------------------------------------------------------------------------
+
+- name: Unseal the bootstrap node
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/unseal"
+    method: POST
+    body_format: json
+    body:
+      key: "{{ item }}"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  loop: "{{ __openbao_unseal_keys[: (__openbao_unseal_threshold | int)] }}"
+  loop_control:
+    index_var: __openbao_key_index
+    label: "key {{ __openbao_key_index }}"
+  changed_when: true
+  no_log: true
+  when:
+    - __openbao_do_unseal | bool
+    - inventory_hostname == openbao_init_bootstrap_node
+    - __openbao_seal_status['initialized']
+    - __openbao_seal_status['sealed']
+  tags: init_unseal
+
+- name: Wait until the bootstrap node is unsealed
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/seal-status"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  register: __openbao_bootstrap_wait
+  until: __openbao_bootstrap_wait is succeeded and not __openbao_bootstrap_wait['json']['sealed']
+  retries: 24
+  delay: 5
+  check_mode: false
+  when:
+    - __openbao_do_unseal | bool
+    - inventory_hostname == openbao_init_bootstrap_node
+    - __openbao_seal_status['initialized']
+  tags: init_unseal
+
+# Before the join wait: a replaced bootstrap node can only join once the
+# other members are unsealed.
+- name: Unseal the other initialized nodes
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/unseal"
+    method: POST
+    body_format: json
+    body:
+      key: "{{ item }}"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  loop: "{{ __openbao_unseal_keys[: (__openbao_unseal_threshold | int)] }}"
+  loop_control:
+    index_var: __openbao_key_index
+    label: "key {{ __openbao_key_index }}"
+  changed_when: true
+  no_log: true
+  when:
+    - __openbao_do_unseal | bool
+    - inventory_hostname != openbao_init_bootstrap_node
+    - __openbao_seal_status['initialized']
+    - __openbao_seal_status['sealed']
+  tags: init_unseal
+
+# A node joins through retry_join once a leader is unsealed; it reports
+# initialized (and sealed) after the join.
+- name: Wait until the joining nodes report initialized
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/seal-status"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  register: __openbao_join_wait
+  until: __openbao_join_wait is succeeded and __openbao_join_wait['json']['initialized']
+  retries: 30
+  delay: 10
+  check_mode: false
+  when:
+    - __openbao_do_unseal | bool
+    - not __openbao_seal_status['initialized']
+  tags: init_unseal
+
+- name: Unseal the nodes that joined
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/unseal"
+    method: POST
+    body_format: json
+    body:
+      key: "{{ item }}"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  loop: "{{ __openbao_unseal_keys[: (__openbao_unseal_threshold | int)] }}"
+  loop_control:
+    index_var: __openbao_key_index
+    label: "key {{ __openbao_key_index }}"
+  changed_when: true
+  no_log: true
+  when:
+    - __openbao_do_unseal | bool
+    - not __openbao_seal_status['initialized']
+    - __openbao_join_wait['json']['sealed'] | default(false)
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 10. Wait until every node is unsealed, or say why nodes stay sealed.
+# ------------------------------------------------------------------------------
+
+- name: Wait until every node is unsealed
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/seal-status"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  register: __openbao_unseal_wait
+  until: __openbao_unseal_wait is succeeded and not __openbao_unseal_wait['json']['sealed']
+  retries: 30
+  delay: 10
+  check_mode: false
+  when: __openbao_expect_unsealed | bool
+  tags: init_unseal
+
+- name: Report the nodes that stay sealed
+  ansible.builtin.debug:
+    msg: >-
+      {{ __openbao_sealed_hosts | join(', ') }} stay sealed because
+      {% if not __openbao_cluster_initialized %}the cluster is not initialized
+      and {{ 'check mode never initializes' if ansible_check_mode else 'openbao_init is false' }}{% elif ansible_check_mode %}check
+      mode never unseals{% else %}openbao_unseal is false (required with
+      PGP-wrapped Shamir shares); unseal them by hand with the keys in
+      {{ openbao_init_output_path }}{% endif %}. The unseal wait and the leader
+      check were skipped.
+  run_once: true
+  when:
+    - not __openbao_expect_unsealed | bool
+    - __openbao_any_sealed | bool
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 11. Formation check without a token: every node sees a leader, and all see
+#     the same one.
+# ------------------------------------------------------------------------------
+
+- name: Wait until every node sees a leader
+  ansible.builtin.uri:
+    url: "{{ __openbao_api_addr }}/v1/sys/leader"
+    validate_certs: true
+    ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+    status_code: 200
+  register: __openbao_leader_wait
+  until: __openbao_leader_wait is succeeded and __openbao_leader_wait['json']['leader_address'] | default('') | length > 0
+  retries: 42
+  delay: 10
+  check_mode: false
+  when: __openbao_expect_unsealed | bool
+  tags: init_unseal
+
+- name: Assert every node reports the same leader
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts | map('extract', hostvars, ['__openbao_leader_wait', 'json', 'leader_address']) | unique | list | length == 1
+    fail_msg: >-
+      The nodes did not agree on one leader.
+      Leader per node:
+      {% for host in ansible_play_hosts %}{{ host }} -> {{ hostvars[host]['__openbao_leader_wait']['json']['leader_address'] | default('none') }}{{ '; ' if not loop.last else '' }}{% endfor %}.
+      Check that every node uses the same openbao_raft_peers and retry_join
+      addresses, and look at journalctl -u openbao on the nodes that differ.
+    quiet: true
+  run_once: true
+  when: __openbao_expect_unsealed | bool
+  tags: init_unseal
