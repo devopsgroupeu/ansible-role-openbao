@@ -33,19 +33,23 @@
   when: __openbao_do_init | bool
   tags: init_unseal
   block:
+    # A stopped member (openbao_service_state: stopped) was not probed, so it
+    # might hold an initialized cluster: it counts as missing.
     - name: Assert the whole cluster is in the play
       ansible.builtin.assert:
         that:
-          - openbao_raft_peers | difference(ansible_play_hosts) | length == 0
+          - openbao_raft_peers | difference(__openbao_started_hosts) | length == 0
         fail_msg: >-
           Initialization needs the whole cluster in the play.
-          No play host reports initialized, but
-          {{ openbao_raft_peers | difference(ansible_play_hosts) | join(', ') }}
-          (members in openbao_raft_peers) are not in this play (play hosts:
-          {{ ansible_play_hosts | join(', ') }}). A member that failed earlier
-          in this run, for example because its API did not answer, counts as
-          missing. Run the role against all members, without --limit or
-          serial, so that no member could already be initialized.
+          No probed play host reports initialized, but
+          {{ openbao_raft_peers | difference(__openbao_started_hosts) | join(', ') }}
+          (members in openbao_raft_peers) are not in this play or not started
+          (probed hosts: {{ __openbao_started_hosts | join(', ') }}). A member
+          that failed earlier in this run, for example because its API did not
+          answer, or that runs with openbao_service_state: stopped counts as
+          missing. Run the role against all members, without --limit and with
+          every member started, so that no member could already be
+          initialized.
         quiet: true
       run_once: true
       tags: init_unseal
@@ -63,21 +67,26 @@
       tags: init_unseal
 
     # Defence in depth behind validate.yml rule 26: the file must also exist,
-    # be readable and hold a password.
+    # be readable and hold a password. The password is read the way the role
+    # uses it (lookup, then trim, as ansible-vault --vault-password-file
+    # does), so a file with only a line break is refused here instead of
+    # encrypting the init output with an empty password.
     - name: Assert the Ansible Vault password file is usable
       ansible.builtin.assert:
         that:
           - openbao_init_encrypt_password_file | length > 0
           - __openbao_init_pass_stat['stat']['readable'] | default(false)
           - __openbao_init_pass_stat['stat']['size'] | default(0) > 0
+          - lookup('ansible.builtin.file', openbao_init_encrypt_password_file) | trim | length > 0
         fail_msg: >-
           Init output encryption requested but no password file set.
           openbao_init_encrypt_password_file
           ('{{ openbao_init_encrypt_password_file }}') is empty, or the file is
-          missing, unreadable or empty on the controller, so the init output
-          could not be encrypted. Nothing was initialized. Point it at a
-          controller-side Ansible Vault password file, or set
-          openbao_init_encrypt_output: false to accept a plain-text init file.
+          missing, unreadable, empty or holds only whitespace on the
+          controller, so the init output could not be encrypted. Nothing was
+          initialized. Point it at a controller-side Ansible Vault password
+          file, or set openbao_init_encrypt_output: false to accept a
+          plain-text init file.
         quiet: true
       run_once: true
       when: openbao_init_encrypt_output | bool
@@ -185,7 +194,8 @@
 # ------------------------------------------------------------------------------
 # 5. Persist on the controller (run_once). The content is encrypted in memory
 #    before it touches disk; decrypt: false keeps copy from decrypting the
-#    vaulted text again.
+#    vaulted text again. The password is trimmed like ansible-vault trims a
+#    password file, so ansible-vault view and rekey open the file as well.
 # ------------------------------------------------------------------------------
 
 - name: Store the init output on the controller
@@ -200,7 +210,7 @@
         decrypt: false
       vars:
         __openbao_init_json: "{{ hostvars[openbao_init_bootstrap_node]['__openbao_init_result']['stdout'] | from_json | to_nice_json }}"
-        __openbao_init_vaulted: "{{ __openbao_init_json | ansible.builtin.vault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file)) }}"
+        __openbao_init_vaulted: "{{ __openbao_init_json | ansible.builtin.vault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file) | trim) }}"
       delegate_to: localhost
       become: false
       run_once: true
@@ -246,7 +256,7 @@
     __openbao_expect_unsealed: "{{ __openbao_cluster_initialized and __openbao_can_unseal_now and not (ansible_check_mode and __openbao_sealed_now | length > 0) }}"
   vars:
     __openbao_can_unseal_now: "{{ openbao_seal_type != 'shamir' or (openbao_unseal | bool and __openbao_unseal_keys | length > 0) }}"
-    __openbao_sealed_now: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('__openbao_seal_status.sealed') | map(attribute='inventory_hostname') | list }}"
+    __openbao_sealed_now: "{{ __openbao_started_hosts | map('extract', hostvars) | selectattr('__openbao_seal_status.sealed') | map(attribute='inventory_hostname') | list }}"
   tags: init_unseal
 
 # ------------------------------------------------------------------------------
@@ -438,14 +448,29 @@
 - name: Assert every node reports the same leader
   ansible.builtin.assert:
     that:
-      - ansible_play_hosts | map('extract', hostvars, ['__openbao_leader_wait', 'json', 'leader_address']) | unique | list | length == 1
+      - __openbao_started_hosts | map('extract', hostvars, ['__openbao_leader_wait', 'json', 'leader_address']) | unique | list | length == 1
     fail_msg: >-
       The nodes did not agree on one leader.
       Leader per node:
-      {% for host in ansible_play_hosts %}{{ host }} -> {{ hostvars[host]['__openbao_leader_wait']['json']['leader_address'] | default('none') }}{{ '; ' if not loop.last else '' }}{% endfor %}.
+      {% for host in __openbao_started_hosts %}{{ host }} -> {{ hostvars[host]['__openbao_leader_wait']['json']['leader_address'] | default('none') }}{{ '; ' if not loop.last else '' }}{% endfor %}.
       Check that every node uses the same openbao_raft_peers and retry_join
       addresses, and look at journalctl -u openbao on the nodes that differ.
     quiet: true
   run_once: true
   when: __openbao_expect_unsealed | bool
+  tags: init_unseal
+
+# ------------------------------------------------------------------------------
+# 12. no_log protects the tasks above, not later consumers: clear the init
+#     output and the unseal keys, so a later task of the playbook that prints
+#     host variables cannot show them. restart.yml loads the keys again.
+# ------------------------------------------------------------------------------
+
+- name: Clear the init output and the unseal keys from the host variables
+  ansible.builtin.set_fact:
+    __openbao_init_result: {}
+    __openbao_init_file_raw: {}
+    __openbao_init_file_keys: []
+    __openbao_unseal_keys: []
+  no_log: true
   tags: init_unseal

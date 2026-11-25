@@ -22,6 +22,17 @@
   when: ansible_facts['os_family'] == 'RedHat'
   tags: install
 
+# semanage, for the file context of the audit directory (config.yml).
+- name: Install the SELinux management tools (RHEL/EL with SELinux)
+  ansible.builtin.dnf:
+    name: policycoreutils-python-utils
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - openbao_manage_selinux | bool
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+  tags: install
+
 # ==============================================================================
 # Signing key. One flow for every run and every method: the candidate (the
 # installed file, or a fresh download while none is installed) is inspected in
@@ -174,7 +185,10 @@
 # plugin until the rolling restart (or the first start in service.yml)
 # replaces them. Each result counts only when its task file ran in this
 # include, so a result registered by an earlier include in the same run
-# (another method or seal) cannot write a marker.
+# (another method or seal) cannot write a marker. A run that stops before
+# this task loses nothing: restart.yml also restarts a node whose running
+# version differs from openbao_version, and a new plugin version changes the
+# plugin stanza of openbao.hcl (config.yml records that restart).
 - name: Record a pending restart after a software change
   ansible.builtin.copy:
     content: "restart pending\n"

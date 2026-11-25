@@ -7,10 +7,11 @@
 # again on each include.
 # Produces:
 #   __openbao_seal_status          parsed sys/seal-status of this node
-#   __openbao_leader               parsed sys/leader, {} when sealed or failing
 #   __openbao_is_leader            this node is the active node
-#   __openbao_cluster_initialized  any play host reports initialized (same
-#                                  value on every host)
+#   __openbao_cluster_initialized  any started play host reports initialized
+#                                  (same value on every host)
+# Runs only on the started hosts (__openbao_started_hosts); a stopped member
+# is never probed or counted.
 # ==============================================================================
 
 # A node that does not answer fails the run: an unknown state never means
@@ -45,7 +46,6 @@
 - name: Record the status of this node
   ansible.builtin.set_fact:
     __openbao_seal_status: "{{ __openbao_probe['json'] }}"
-    __openbao_leader: "{{ __openbao_leader_json }}"
     __openbao_is_leader: "{{ __openbao_leader_json['is_self'] | default(false) | bool }}"
   vars:
     __openbao_leader_json: "{{ __openbao_leader_probe['json'] | default({}) if __openbao_leader_probe['status'] | default(0) == 200 else {} }}"
@@ -53,5 +53,5 @@
 
 - name: Record whether the cluster is initialized
   ansible.builtin.set_fact:
-    __openbao_cluster_initialized: "{{ ansible_play_hosts | map('extract', hostvars, ['__openbao_seal_status', 'initialized']) | select | list | length > 0 }}"
+    __openbao_cluster_initialized: "{{ __openbao_started_hosts | map('extract', hostvars, ['__openbao_seal_status', 'initialized']) | select | list | length > 0 }}"
   tags: [init_unseal, restart]

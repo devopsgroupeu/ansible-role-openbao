@@ -46,6 +46,17 @@ __openbao_gpg_key_path: "/usr/local/share/openbao/openbao-signing-key.asc"
 # process and after the node passed the restart health gate.
 __openbao_restart_marker: "{{ openbao_config_dir }}/.ansible-restart-pending"
 
+# Play hosts that run the API stages (init_unseal.yml, restart.yml): those
+# with openbao_service_state 'started' (published as __openbao_service_state
+# by facts.yml). A stopped member skips these stages, so its probe facts are
+# missing or stale and are never aggregated. Evaluated on every use, so a host
+# that failed earlier in the play drops out.
+__openbao_started_hosts: >-
+  {{ ansible_play_hosts | map('extract', hostvars)
+     | selectattr('__openbao_service_state', 'defined')
+     | selectattr('__openbao_service_state', 'equalto', 'started')
+     | map(attribute='inventory_hostname') | list }}
+
 # Environment for the bao CLI (operator init only). BAO_CACERT is added when
 # TLS is enabled. The role never sets BAO_TOKEN.
 __openbao_cli_env: "{{ {'BAO_ADDR': __openbao_api_addr} | combine({'BAO_CACERT': openbao_tls_ca_file} if openbao_tls_enabled | bool else {}) }}"
@@ -78,6 +89,29 @@ __openbao_kms_microarch:
 # new file plus a config change. Defined here, not as a fact, because
 # openbao.hcl.j2 needs it in config-only mode too.
 __openbao_seal_plugin_command: "openbao-plugin-kms-{{ __openbao_kms_plugins.get(openbao_seal_type, '') }}_{{ openbao_seal_plugin_version }}"
+
+# Non-secret seal settings that select the key, per seal type. On a node with
+# raft data the seal key guard in config.yml refuses a change of any of them
+# (a seal migration). Each is rendered from openbao_seal_<type>_<setting>.
+# The transit address is left out: the unsealer may move to another DNS name.
+__openbao_seal_key_settings:
+  static:
+    - current_key_id
+  transit:
+    - mount_path
+    - key_name
+    - namespace
+  awskms:
+    - region
+    - kms_key_id
+  azurekeyvault:
+    - vault_name
+    - key_name
+  gcpckms:
+    - project
+    - region
+    - key_ring
+    - crypto_key
 
 # Seal types the role supports (validate.yml rule 5).
 __openbao_seal_types:

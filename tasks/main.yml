@@ -25,10 +25,13 @@
   when: not openbao_config_only | bool
   tags: service
 
-# Run pending handlers (certificate reload) before any API call.
+# Run pending handlers (certificate reload) before any API call. Tagged
+# always: an untagged flush is skipped under --tags (for example
+# --tags tls,init_unseal), and the probes would then see the old certificate.
 - name: Flush handlers
   ansible.builtin.meta: flush_handlers
   when: not openbao_config_only | bool
+  tags: always
 
 # A stopped service (maintenance) is neither initialized nor unsealed.
 - name: Initialize and unseal OpenBao

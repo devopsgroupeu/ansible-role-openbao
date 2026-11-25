@@ -49,7 +49,7 @@
           vars:
             __openbao_init_text: "{{ __openbao_init_file_raw['content'] | b64decode }}"
             __openbao_init_json: >-
-              {{ (__openbao_init_text | ansible.builtin.unvault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file))
+              {{ (__openbao_init_text | ansible.builtin.unvault(lookup('ansible.builtin.file', openbao_init_encrypt_password_file) | trim)
                   if __openbao_init_text.startswith('$ANSIBLE_VAULT') else __openbao_init_text) | from_json }}
           run_once: true
           no_log: true

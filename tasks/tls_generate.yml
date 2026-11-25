@@ -178,6 +178,7 @@
     owner: root
     group: "{{ openbao_group }}"
     mode: "{{ openbao_tls_key_mode }}"
+  register: __openbao_node_key_ecc
   when: openbao_tls_cert_key_type == 'ECC'
   tags: tls
 
@@ -189,7 +190,17 @@
     owner: root
     group: "{{ openbao_group }}"
     mode: "{{ openbao_tls_key_mode }}"
+  register: __openbao_node_key_rsa
   when: openbao_tls_cert_key_type == 'RSA'
+  tags: tls
+
+# The public key of the key file, for the key check below. Returns no private
+# key data. Fails only when the key file is missing (check mode).
+- name: Read the public key of the node private key
+  community.crypto.openssl_privatekey_info:
+    path: "{{ openbao_tls_key_file }}"
+  register: __openbao_node_key_info
+  failed_when: false
   tags: tls
 
 - name: Generate the node CSR (in memory)
@@ -226,10 +237,12 @@
 
 # x509_certificate ignores timestamps and does not notice a renewed or
 # replaced CA, so re-sign when the certificate is missing, expires within 30
-# days, lacks a required SAN, the CA changed in this run, or it was issued by
+# days, lacks a required SAN, the CA changed in this run, it was issued by
 # another CA (authority key id differs from the CA's subject key id: a
 # replaced bootstrap node created a new CA and an earlier run stopped before
-# re-signing).
+# re-signing), or it does not belong to the key file (the key was replaced or
+# deleted, or an earlier run stopped between key and certificate). The key
+# task results only matter in check mode, where the key file is unchanged.
 - name: Decide whether the node certificate needs to be (re)signed
   ansible.builtin.set_fact:
     __openbao_regen_cert: >-
@@ -238,6 +251,9 @@
         or not __openbao_existing_cert.get('valid_at', {}).get('check', false)
         or __openbao_ca_cert_result is changed
         or __openbao_ca_cert_copy is changed
+        or __openbao_node_key_ecc is changed
+        or __openbao_node_key_rsa is changed
+        or __openbao_existing_cert.get('public_key', '') != __openbao_node_key_info.get('public_key', '-')
         or __openbao_existing_cert.get('authority_key_identifier') != __openbao_ca_info['subject_key_identifier']
         or (
           __openbao_tls_sans | map('regex_replace', '^(DNS|IP|IP Address):', '') | list

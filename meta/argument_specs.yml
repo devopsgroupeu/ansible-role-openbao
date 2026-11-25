@@ -348,7 +348,8 @@ argument_specs:
         choices: [shamir, static, transit, awskms, azurekeyvault, gcpckms]
         description: >
           Seal type. The cloud seals use external KMS plugins. The role refuses
-          to change it on a node with raft data (manual seal migration).
+          to change it, or the settings that select the seal key, on a node
+          with raft data (manual seal migration).
 
       openbao_seal_static_current_key_id:
         type: str
@@ -593,7 +594,8 @@ argument_specs:
         default: ""
         description: >
           Controller-side plain-text password file used to encrypt the init
-          output and to read it back. Required when openbao_init and
+          output and to read it back (leading and trailing whitespace is
+          stripped, as ansible-vault does). Required when openbao_init and
           openbao_init_encrypt_output are true.
 
       openbao_cluster_id:
@@ -755,7 +757,10 @@ argument_specs:
         type: bool
         required: false
         default: true
-        description: Run restorecon on the role's directories on EL when SELinux is enabled.
+        description: >
+          On EL with SELinux enabled, label the audit directory var_log_t (so
+          logrotate may rotate it) and run restorecon on the role's
+          directories.
 
       # ---- Service control ----
       openbao_service_enabled:

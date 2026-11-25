@@ -5,13 +5,41 @@
 # Produces:
 #   __openbao_api_addr          this node's API URL (role defaults are not
 #                               visible to other hosts through hostvars)
+#   __openbao_service_state     this node's openbao_service_state, read by
+#                               __openbao_started_hosts (vars/main.yml)
 #   __openbao_member_api_addrs  API URLs of all members, self included
 #   __openbao_retry_join_addrs  API URLs of all members except self
 # ==============================================================================
 
-- name: Publish this node's API address
+# The cluster-wide tasks read other hosts' facts through hostvars and drive
+# the rolling restart from run_once tasks, which needs the linear strategy
+# with all members in one batch. Under linear this run_once task runs on the
+# first member in play order (every play host that runs the role is a member,
+# validate.yml rule 12). Under the free strategy run_once is ignored and it
+# runs on every host, so every other member fails; with serial the batch is
+# smaller than the play.
+- name: Validate the play strategy and batch size
+  ansible.builtin.assert:
+    that:
+      - ansible_play_batch | length == ansible_play_hosts | length
+      - inventory_hostname == ansible_play_hosts | select('in', openbao_raft_peers) | first
+    fail_msg: >-
+      The role needs the linear strategy without serial.
+      {{ inventory_hostname }} runs this check in a batch of
+      {{ ansible_play_batch | length }} of {{ ansible_play_hosts | length }}
+      play hosts ({{ ansible_play_batch | join(', ') }}), or under a strategy
+      that ignores run_once (free). The cluster checks and the rolling
+      restart need every member in one batch of a linear play: remove serial
+      and strategy from the play (use --limit with
+      openbao_raft_retry_join_api_addrs for partial day-2 runs).
+    quiet: true
+  run_once: true
+  tags: always
+
+- name: Publish this node's API address and service state
   ansible.builtin.set_fact:
     __openbao_api_addr: "{{ openbao_api_addr }}"
+    __openbao_service_state: "{{ openbao_service_state }}"
   tags: always
 
 # --limit guard: without explicit retry_join addresses the member URLs come

@@ -2,6 +2,9 @@
 # Changes to this file will be overwritten on the next playbook run.
 # OpenBao file audit log. No 'su' line: the audit directory is not group
 # writable, so root may rotate it; SIGHUP makes the device reopen its file.
+# SIGHUP also makes OpenBao re-read openbao.hcl (log level, audit devices,
+# KMS plugin stanzas), so a rendered but not yet restarted config is partly
+# applied by this reload.
 {{ openbao_audit_file_path }} {
     daily
     rotate {{ openbao_audit_logrotate_rotate }}

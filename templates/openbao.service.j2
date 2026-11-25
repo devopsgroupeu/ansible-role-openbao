@@ -42,7 +42,10 @@ CapabilityBoundingSet=
 {% if openbao_systemd_hardening | bool %}
 # Role hardening (openbao_systemd_hardening), not upstream guidance.
 ProtectSystem=strict
-ReadWritePaths={{ openbao_data_dir }}{{ (' ' ~ openbao_audit_dir) if openbao_audit_enabled | bool else '' }}
+# The audit directory stays writable while openbao_audit_enabled is false:
+# OpenBao opens every device of the replicated audit table at unseal, before
+# it removes the ones no longer declared in openbao.hcl.
+ReadWritePaths={{ openbao_data_dir }} {{ openbao_audit_dir }}
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

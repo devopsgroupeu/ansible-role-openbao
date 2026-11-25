@@ -40,9 +40,12 @@
 # through the config file, so these checks fail closed before anything is
 # rendered. Skipped in config-only mode. Produces per host:
 #   __openbao_has_raft_data     the node has raft data (vault.db exists)
+#   __openbao_foreign_data      other entries of the data directory while it
+#                               has no vault.db (another storage backend)
 #   __openbao_old_node_id       node_id of the existing openbao.hcl ('' if none)
 #   __openbao_old_seal_type     seal of the existing openbao.hcl ('shamir' if
 #                               it has no seal stanza or does not exist)
+#   __openbao_old_seal_settings quoted settings of that seal stanza, as a dict
 #   __openbao_audit_old_block   text between the audit markers of the existing
 #   __openbao_audit_new_block   openbao.hcl and of audit.hcl.j2 rendered now,
 #                               whitespace-normalized ('' if absent)
@@ -71,11 +74,30 @@
       register: __openbao_raft_db_stat
       tags: config
 
+    # vault.db is the raft marker. The package config (2.7.1 and later) uses
+    # storage "pebbledb" in the same default directory, so a node started
+    # once with it holds data the raft checks would not see.
+    - name: List the entries of the data directory
+      ansible.builtin.find:
+        paths: "{{ openbao_data_dir }}"
+        file_type: any
+        hidden: true
+        excludes:
+          - vault.db
+          - raft
+          - node-id
+          - lost+found
+      register: __openbao_data_entries
+      tags: config
+
     # The marker lines are the compatibility contract of audit.hcl.j2; the
     # layout between them may change between releases.
     - name: Record the old and the new guarded settings
       ansible.builtin.set_fact:
         __openbao_has_raft_data: "{{ __openbao_raft_db_stat['stat']['exists'] }}"
+        __openbao_foreign_data: >-
+          {{ [] if __openbao_raft_db_stat['stat']['exists']
+             else __openbao_data_entries['files'] | map(attribute='path') | map('basename') | sort }}
         __openbao_old_node_id: >-
           {{ __openbao_old_hcl_text
              | regex_search('(?m)^\s*node_id\s*=\s*"([^"]*)"', '\1')
@@ -84,6 +106,11 @@
           {{ __openbao_old_hcl_text
              | regex_search('(?m)^seal "([a-z]+)"', '\1')
              | default(['shamir'], true) | first }}
+        __openbao_old_seal_settings: >-
+          {{ dict(__openbao_old_hcl_text
+                  | regex_search('(?ms)^seal "[a-z]+" \{\n(.*?)^\}', '\1')
+                  | default([''], true) | first
+                  | regex_findall('(?m)^\s*([a-z_]+)\s*=\s*"([^"]*)"')) }}
         __openbao_audit_old_block: >-
           {{ __openbao_old_hcl_text
              | regex_search(__openbao_audit_markers_re, '\1')
@@ -98,6 +125,25 @@
         __openbao_old_hcl_text: "{{ (__openbao_old_hcl['content'] | b64decode) if __openbao_old_hcl_stat['stat']['exists'] else '' }}"
         __openbao_audit_markers_re: '(?s)# BEGIN ANSIBLE MANAGED AUDIT DEVICE\n(.*?)# END ANSIBLE MANAGED AUDIT DEVICE'
       tags: config
+
+- name: Refuse a data directory of another storage backend
+  ansible.builtin.assert:
+    that:
+      - __openbao_foreign_data | length == 0
+    fail_msg: >-
+      Data directory holds another storage backend.
+      {{ inventory_hostname }} has no raft data (vault.db) in
+      {{ openbao_data_dir }}, but the directory is not empty:
+      {{ __openbao_foreign_data | join(', ') }}. This is typically the
+      pebbledb store of the package's own /etc/openbao/openbao.hcl, written
+      when the service was started before the role configured it. The role
+      renders raft storage into this directory, and OpenBao would start an
+      empty, uninitialized node next to that data. Move the data to raft with
+      'bao operator migrate', or, if it holds nothing you need, stop openbao
+      and empty {{ openbao_data_dir }}, then re-run.
+    quiet: true
+  when: not openbao_config_only | bool
+  tags: config
 
 - name: Refuse a raft node id change
   ansible.builtin.assert:
@@ -136,6 +182,42 @@
   when: not openbao_config_only | bool
   tags: config
 
+# Same seal type, other key: the settings in __openbao_seal_key_settings
+# (vars/main.yml) name the key, so changing one is a seal migration as well.
+# Values are compared in their HCL-escaped form (hcl_str in openbao.hcl.j2);
+# an absent setting counts as empty.
+- name: Refuse a seal key change
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (__openbao_has_raft_data | bool
+             and __openbao_old_seal_type == openbao_seal_type
+             and __openbao_seal_key_changes | length > 0)
+    fail_msg: >-
+      Seal key change refused.
+      {{ inventory_hostname }} has raft data in {{ openbao_data_dir }} and its
+      openbao.hcl uses the '{{ openbao_seal_type }}' seal with other key
+      settings than requested: {{ __openbao_seal_key_changes | join('; ') }}.
+      Unsealing with another key (or another unsealer key, KMS key, vault or
+      key ring) is a seal migration, which the role does not perform (see
+      docs/TROUBLESHOOTING.md); rolled out as a config change it would leave
+      every restarted node sealed. Restore the old values, or migrate by
+      hand first.
+    quiet: true
+  vars:
+    __openbao_seal_key_changes: >-
+      {%- set ns = namespace(changes=[]) -%}
+      {%- for key in __openbao_seal_key_settings.get(openbao_seal_type, []) -%}
+      {%- set old = __openbao_old_seal_settings.get(key, '') -%}
+      {%- set new = (lookup('ansible.builtin.vars', 'openbao_seal_' ~ openbao_seal_type ~ '_' ~ key) | string | to_json)[1:-1] -%}
+      {%- if old != new -%}
+      {%- set ns.changes = ns.changes + [key ~ " '" ~ old ~ "' -> '" ~ new ~ "'"] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.changes }}
+  when: not openbao_config_only | bool
+  tags: config
+
 # Cluster-wide: OpenBao replicates the audit table, so the old devices of all
 # play hosts and the new settings of all play hosts must agree. Blocks
 # without a device are ignored, so adding a device (no old stanza anywhere)
@@ -167,7 +249,59 @@
 # ==============================================================================
 # Rendered files. openbao.env comes first: a missing EnvironmentFile is a hard
 # unit failure.
+# Restart intent is a persistent marker written by a task, not a handler
+# (spec section 5.8), and it is written before any of the three files
+# changes: they are compared in check mode first. So a run that stops after a
+# render (a failed validate hook, a lost connection, Ctrl-C) cannot lose the
+# restart; the rolling restart in restart.yml removes the marker per node. A
+# render that then fails leaves a marker for an unchanged file, which costs
+# one health-gated restart. Check mode writes no marker; restart.yml reads
+# __openbao_render_check instead.
 # ==============================================================================
+
+# diff: false, so --check --diff shows each diff once (and never openbao.env).
+- name: Compare the rendered files with the files on the node
+  ansible.builtin.template:
+    src: "{{ item['src'] }}"
+    dest: "{{ item['dest'] }}"
+    owner: "{{ item['owner'] }}"
+    group: "{{ item['group'] }}"
+    mode: "{{ item['mode'] }}"
+  loop:
+    - src: openbao.env.j2
+      dest: "{{ openbao_config_dir }}/openbao.env"
+      owner: root
+      group: root
+      mode: "0600"
+    - src: openbao.hcl.j2
+      dest: "{{ openbao_config_dir }}/openbao.hcl"
+      owner: "{{ openbao_user }}"
+      group: "{{ openbao_group }}"
+      mode: "0640"
+    - src: openbao.service.j2
+      dest: /etc/systemd/system/openbao.service
+      owner: root
+      group: root
+      mode: "0644"
+  loop_control:
+    label: "{{ item['dest'] }}"
+  check_mode: true
+  diff: false
+  register: __openbao_render_check
+  tags: config
+
+- name: Record a pending restart before a config change
+  ansible.builtin.copy:
+    content: "restart pending\n"
+    dest: "{{ __openbao_restart_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - __openbao_render_check is changed
+    - not openbao_config_only | bool
+    - not ansible_check_mode
+  tags: config
 
 - name: Render openbao.env
   ansible.builtin.template:
@@ -176,7 +310,6 @@
     owner: root
     group: root
     mode: "0600"
-  register: __openbao_env_result
   no_log: true
   tags: config
 
@@ -192,7 +325,6 @@
     mode: "0640"
     backup: true
     validate: "{{ omit if openbao_config_only | bool else openbao_bin_path ~ ' operator validate-config -config=%s' }}"
-  register: __openbao_hcl_result
   tags: config
 
 - name: Render the openbao.service unit
@@ -202,23 +334,6 @@
     owner: root
     group: root
     mode: "0644"
-  register: __openbao_unit_result
-  tags: config
-
-# Restart intent is a persistent marker written by a task, not a handler
-# (spec section 5.8): it survives a run that fails before the restart stage,
-# and the rolling restart in restart.yml removes it per node.
-- name: Record a pending restart after a config change
-  ansible.builtin.copy:
-    content: "restart pending\n"
-    dest: "{{ __openbao_restart_marker }}"
-    owner: root
-    group: root
-    mode: "0600"
-  when:
-    - __openbao_env_result is changed or __openbao_hcl_result is changed or __openbao_unit_result is changed
-    - not openbao_config_only | bool
-    - not ansible_check_mode
   tags: config
 
 # ==============================================================================
@@ -245,8 +360,49 @@
   tags: config
 
 # ==============================================================================
-# SELinux contexts (RedHat family only)
+# SELinux contexts (RedHat family only). The audit directory gets a log type
+# first: under /opt it would be usr_t, which the confined logrotate domain
+# (logrotate_t) may read but not rename or create, so the daily rotation
+# would be denied and the audit log would grow until the disk is full.
+# semanage comes from policycoreutils-python-utils (install.yml).
 # ==============================================================================
+
+- name: SELinux file context of the audit directory
+  when:
+    - openbao_manage_selinux | bool
+    - ansible_facts['os_family'] == 'RedHat'
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+    - not openbao_config_only | bool
+  vars:
+    __openbao_audit_fcontext: "{{ openbao_audit_dir }}(/.*)?"
+  tags: config
+  block:
+    - name: List the local SELinux file context rules
+      ansible.builtin.command:
+        argv:
+          - semanage
+          - fcontext
+          - --list
+          - --locallist
+      register: __openbao_selinux_local
+      changed_when: false
+      check_mode: false
+      tags: config
+
+    # A local rule for the same pattern (any type) is the operator's choice
+    # and is left alone.
+    - name: Label the audit directory as a log directory
+      ansible.builtin.command:
+        argv:
+          - semanage
+          - fcontext
+          - --add
+          - --type
+          - var_log_t
+          - "{{ __openbao_audit_fcontext }}"
+      changed_when: true
+      when: __openbao_selinux_local['stdout_lines'] | select('match', (__openbao_audit_fcontext | regex_escape) ~ '\\s') | list | length == 0
+      tags: config
 
 - name: Restore SELinux contexts on the OpenBao directories
   ansible.builtin.command:

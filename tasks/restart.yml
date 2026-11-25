@@ -9,6 +9,8 @@
 # restart_node.yml checks quorum before and health after each node. A Shamir
 # cluster whose unseal keys are missing is refused before any restart.
 # Check mode: lists the nodes that would be restarted, restarts nothing.
+# Only started play hosts (__openbao_started_hosts) are ordered; a stopped
+# member keeps its marker until service.yml starts it.
 # Produces:
 #   __openbao_restart_required  this node needs a restart
 #   __openbao_restart_order     flagged nodes, leader last (same on every host)
@@ -25,11 +27,17 @@
   register: __openbao_restart_marker_stat
   tags: restart
 
+# Check mode writes no marker, so a render or package change that this check
+# run reports flags the node too, and the report matches the real run. The
+# defaults keep --tags restart --check working (config and install skipped).
 - name: Record whether this node needs a restart
   ansible.builtin.set_fact:
     __openbao_restart_required: >-
       {{ __openbao_restart_marker_stat['stat']['exists']
-         or __openbao_seal_status['version'] | default('') != openbao_version }}
+         or __openbao_seal_status['version'] | default('') != openbao_version
+         or (ansible_check_mode
+             and (__openbao_render_check | default({}) is changed
+                  or __openbao_pkg_result | default({}) is changed)) }}
   tags: restart
 
 # Always (re)loaded, not only when undefined: facts persist across the plays
@@ -48,7 +56,7 @@
   ansible.builtin.set_fact:
     __openbao_restart_order: >-
       {%- set ns = namespace(standbys=[], leaders=[]) -%}
-      {%- for host in ansible_play_hosts if hostvars[host]['__openbao_restart_required'] | bool -%}
+      {%- for host in __openbao_started_hosts if hostvars[host]['__openbao_restart_required'] | bool -%}
       {%- if hostvars[host]['__openbao_is_leader'] | bool -%}
       {%- set ns.leaders = ns.leaders + [host] -%}
       {%- else -%}
@@ -103,4 +111,14 @@
     index_var: __openbao_node_index
   run_once: true
   when: not ansible_check_mode
+  tags: restart
+
+# Same as at the end of init_unseal.yml: the unseal keys stay in host
+# variables only while this stage needs them.
+- name: Clear the unseal keys from the host variables
+  ansible.builtin.set_fact:
+    __openbao_init_file_raw: {}
+    __openbao_init_file_keys: []
+    __openbao_unseal_keys: []
+  no_log: true
   tags: restart
