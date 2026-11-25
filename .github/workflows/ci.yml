@@ -42,8 +42,8 @@ jobs:
       # (three systemd containers fit a standard runner). The live scenarios
       # run on Debian-family containers; default also runs on rockylinux9,
       # which covers the EL 9 package path (dnf, yum_repository, rpm_key).
-      # restorecon and update-ca-trust stay lint-only (SELinux is off in the
-      # container and the scenario does not touch the trust store).
+      # semanage, restorecon and update-ca-trust stay lint-only (SELinux is
+      # off in the container and the scenario does not touch the trust store).
       matrix:
         include:
           # render - offline template rendering and the fail-closed input checks

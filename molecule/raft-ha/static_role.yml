@@ -1,0 +1,53 @@
+---
+# The role through a static roles: entry with the vars of the Heal play of
+# verify.yml. verify.yml runs this playbook as a separate ansible-playbook
+# process, so no fact of an earlier play exists, and passes with -e:
+#   verify_stopped   inventory names that get openbao_service_state: stopped
+#   verify_serial    the play's serial
+#   verify_strategy  the play's strategy
+
+- name: Static role entry
+  hosts: all
+  become: true
+  gather_facts: true
+  strategy: "{{ verify_strategy | default('linear') }}"
+  serial: "{{ verify_serial | default(0) }}"
+  vars:
+    # The version of the upgrade play of verify.yml.
+    openbao_version: "2.7.3"
+
+    # One Shamir share is enough for a test cluster.
+    openbao_init_key_shares: 1
+
+    # Threshold must not exceed the share count.
+    openbao_init_key_threshold: 1
+
+    # Plain-text init output, as in converge.yml.
+    openbao_init_encrypt_output: false
+
+    # Keep the init output in the ephemeral directory Molecule prunes.
+    openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+
+    # Fixed cluster id instead of the inventory-derived default.
+    openbao_cluster_id: molecule-raft-ha
+
+    # No pre-placed certificates in the containers: generate a shared CA.
+    openbao_tls_generate_certs: true
+
+    # Each node advertises its container name (Docker DNS on the scenario network).
+    openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+
+    # Cluster address on the container name, port 8201.
+    openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+
+    # Do not touch the OS trust store of the ephemeral containers.
+    openbao_tls_install_ca_to_trust_store: false
+
+    # The log level of the Heal play, so this run changes no config.
+    openbao_log_level: warn
+
+    # Maintenance stop of the hosts named in verify_stopped.
+    openbao_service_state: "{{ 'stopped' if inventory_hostname in (verify_stopped | default([])) else 'started' }}"
+
+  roles:
+    - role: ansible-role-openbao

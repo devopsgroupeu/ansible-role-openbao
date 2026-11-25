@@ -1,5 +1,5 @@
 ---
-# Verify for the raft-ha scenario (spec section 12.2, List D), plays 1-7:
+# Verify for the raft-ha scenario (spec section 12.2, List D), plays 1-8:
 #   1. converge result on every node (2.7.2, initialized, unsealed, no marker)
 #   2. cluster state with the root token; record the leader, the unit state
 #      and a journal cursor per node
@@ -8,9 +8,12 @@
 #   4. quorum guard: openbao3 stopped, the role on openbao1 and openbao2
 #      refuses to restart and leaves both nodes untouched with their markers
 #   5. heal: openbao3 back, the pending restarts of play 4 run on all nodes
-#   6. replace node: openbao3 with an empty data directory joins again, no
-#      operator init
-#   7. peers fallback: openbao_raft_peers of one host in a three-host play
+#   6. static_role.yml as separate runs: openbao3 in maintenance
+#      (openbao_service_state: stopped) while the others converge; serial
+#      and the free strategy are refused
+#   7. replace node: remove-peer, then openbao3 with an empty data directory
+#      joins again as a new peer, no operator init
+#   8. peers fallback: openbao_raft_peers of one host in a three-host play
 #      fails validate.yml on every node (Review Focus 1)
 # Plays that re-include the role repeat the converge vars (plays do not
 # inherit them) with openbao_version 2.7.3 from play 3 on. The root token is
@@ -409,8 +412,135 @@
     - name: Check the raft peers and autopilot after the healing run
       ansible.builtin.include_tasks: tasks/check_cluster.yml
 
-# A dead node is replaced by a fresh one with the same inventory name: it
-# joins through retry_join and is unsealed; nothing is initialized again.
+# static_role.yml as separate ansible-playbook processes (no facts of earlier
+# plays):
+#   1. openbao3 in maintenance (openbao_service_state: stopped): the run
+#      succeeds, openbao3 is stopped, openbao1 and openbao2 stay unsealed
+#   2. serial: 1 and strategy: free are refused before anything changes
+- name: Maintenance stop of one member and the play shape guard
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_nested_cmd:
+      - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+      - -i
+      - "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/inventory"
+      - "{{ lookup('ansible.builtin.env', 'MOLECULE_SCENARIO_DIRECTORY') }}/static_role.yml"
+    __verify_nested_env:
+      ANSIBLE_NOCOLOR: "1"
+      ANSIBLE_FORCE_COLOR: "0"
+      PY_COLORS: "0"
+  tasks:
+    - name: Run the role with openbao3 in maintenance
+      ansible.builtin.command:
+        argv: "{{ __verify_nested_cmd + ['-e', '{\"verify_stopped\": [\"openbao3\"]}'] }}"
+      environment: "{{ __verify_nested_env }}"
+      register: __verify_stopped_run
+      changed_when: true
+      failed_when: __verify_stopped_run['rc'] != 0
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Gather service facts after the maintenance run
+      ansible.builtin.service_facts:
+
+    - name: Read the seal status of the started members
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_maint
+      when: inventory_hostname != 'openbao3'
+
+    - name: Assert openbao3 is stopped
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['openbao.service']['state'] != 'running'
+        fail_msg: "{{ ansible_facts['services']['openbao.service'] | to_json }}"
+        success_msg: openbao3 stays stopped
+      when: inventory_hostname == 'openbao3'
+
+    - name: Assert the started members run and are unsealed
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['openbao.service']['state'] == 'running'
+          - not __verify_seal_maint['json']['sealed']
+        fail_msg: >-
+          service {{ ansible_facts['services']['openbao.service'] | to_json }},
+          seal status {{ __verify_seal_maint['json'] | to_json }}
+        success_msg: the member runs and is unsealed
+      when: inventory_hostname != 'openbao3'
+
+    - name: Read the unit state before the refused runs
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Remember the unit state before the refused runs
+      ansible.builtin.set_fact:
+        __verify_unit_shape_before: "{{ __verify_unit }}"
+
+    - name: Record the openbao.hcl checksum before the refused runs
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_shape_before
+
+    - name: Run the role with serial 1 and with the free strategy
+      ansible.builtin.command:
+        argv: "{{ __verify_nested_cmd + ['-e', item] }}"
+      environment: "{{ __verify_nested_env }}"
+      loop:
+        - verify_serial=1
+        - verify_strategy=free
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_shape_runs
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    # Molecule's ansible.cfg sets display_failed_stderr, so the failure is on
+    # stderr.
+    - name: Assert both runs were refused by the play shape guard
+      ansible.builtin.assert:
+        that:
+          - item['rc'] != 0
+          - "'The role needs the linear strategy without serial.' in (item['stdout'] ~ item['stderr'])"
+        fail_msg: "{{ item['item'] }}: rc {{ item['rc'] }}, {{ (item['stdout_lines'] + item['stderr_lines']) | select('search', 'fatal|FAILED|ERROR') | list | to_json }}"
+        success_msg: "{{ item['item'] }} was refused"
+      loop: "{{ __verify_shape_runs['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+      run_once: true
+
+    - name: Read the unit state after the refused runs
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Record the openbao.hcl checksum after the refused runs
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_shape_after
+
+    - name: Assert the refused runs changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_unit['invocation_id'] == __verify_unit_shape_before['invocation_id']
+          - __verify_hcl_shape_after['stat']['checksum'] == __verify_hcl_shape_before['stat']['checksum']
+        fail_msg: >-
+          InvocationID {{ __verify_unit_shape_before['invocation_id'] }} ->
+          {{ __verify_unit['invocation_id'] }}, openbao.hcl changed:
+          {{ __verify_hcl_shape_after['stat']['checksum'] != __verify_hcl_shape_before['stat']['checksum'] }}
+        success_msg: no restart and no config change
+
+# A dead node is replaced by a fresh one: the dead peer is removed from raft
+# first (upstream outage recovery), then the fresh host with the same
+# inventory name and an empty data directory joins through retry_join as a
+# new peer and is unsealed; nothing is initialized again.
 - name: Replace node
   hosts: all
   become: true
@@ -426,6 +556,37 @@
         name: openbao
         state: stopped
       when: inventory_hostname == 'openbao3'
+
+    # The two remaining voters keep the quorum; retries cover the election
+    # when openbao3 was the leader.
+    - name: Remove the dead peer from raft
+      ansible.builtin.command: bao operator raft remove-peer openbao3
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      register: __verify_remove_peer
+      until: __verify_remove_peer['rc'] == 0
+      retries: 12
+      delay: 5
+      changed_when: true
+      no_log: true
+      when: inventory_hostname == 'openbao1'
+
+    - name: List the raft peers after the removal
+      ansible.builtin.command: bao operator raft list-peers -format=json
+      environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+      register: __verify_peers_removed
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == 'openbao1'
+
+    - name: Assert openbao3 is no raft peer any more
+      ansible.builtin.assert:
+        that:
+          - __verify_servers | map(attribute='node_id') | sort == ['openbao1', 'openbao2']
+        fail_msg: "{{ __verify_servers | to_json }}"
+        success_msg: raft lists openbao1 and openbao2 only
+      vars:
+        __verify_servers: "{{ (__verify_peers_removed['stdout'] | from_json)['data']['config']['servers'] }}"
+      when: inventory_hostname == 'openbao1'
 
     - name: Find the contents of the openbao3 data directory
       ansible.builtin.find:

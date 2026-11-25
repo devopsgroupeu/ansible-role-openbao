@@ -705,16 +705,18 @@
     - name: Read the rendered files
       ansible.builtin.include_tasks: tasks/read_rendered.yml
 
-    - name: Assert markers without a device, no logrotate rule, no audit write path
+    # The audit directory stays writable: the replicated audit table still
+    # holds the device when the node unseals with this config.
+    - name: Assert markers without a device, no logrotate rule, audit dir still writable
       ansible.builtin.assert:
         that:
           - "'# BEGIN ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
           - "'# END ANSIBLE MANAGED AUDIT DEVICE' in __verify_hcl_lines"
           - "'audit \"' not in __verify_hcl"
           - not __verify_logrotate['stat']['exists']
-          - "'ReadWritePaths=/opt/openbao/data' in __verify_unit_lines"
+          - "'ReadWritePaths=/opt/openbao/data /opt/openbao/audit' in __verify_unit_lines"
         fail_msg: "{{ __verify_hcl }}{{ __verify_unit }}"
-        success_msg: audit device, logrotate rule and audit write path are removed
+        success_msg: audit device and logrotate rule are removed, the audit directory stays writable
 
 - name: Render - hardening off, privileged API port
   hosts: all

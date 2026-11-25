@@ -6,8 +6,11 @@
 # static seal, recovery keys and no unseal keys in the init output, no secret
 # in openbao.hcl or the journal, no GnuPG leftovers. "Converge config change"
 # proves that a config change restarts the node exactly once and that it
-# comes back unsealed without unseal keys. Then the two KMS plugin installs
-# of converge.yml are checked. The negative plays feed tampered release files
+# comes back unsealed without unseal keys; another static key id is refused.
+# Then the two KMS plugin installs of converge.yml are checked, the role's
+# templates for the cloud seals and the other render-only branches pass
+# bao operator validate-config, and a second, hardened instance with seal
+# "awskms" starts the installed plugin. The negative plays feed tampered release files
 # from a local file:// mirror to the binary and plugin verification, refuse a
 # downgrade and an unverified plugin download, and check that the failed runs
 # left nothing behind. The last play refuses a wrong signing key fingerprint.
@@ -358,6 +361,67 @@
         fail_msg: "{{ __verify_seal_after['json'] | to_json }}, marker present: {{ __verify_marker_after['stat']['exists'] }}"
         success_msg: the node auto-unsealed after the restart, log_level is debug, no marker left
 
+# Same seal type, other key id: a seal migration that must be refused before
+# anything is rendered (the node would come back sealed after a restart).
+- name: Negative - seal key change
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before_key
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with another static key id
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_log_level: debug
+            openbao_install_method: binary
+            openbao_binary_checksum: "{{ {'amd64': '131df9a21cf3dd2dff47107110b369c9974cbdaa482bcbc723b81b3403c68ecd', 'arm64': 'b505b07af4206fdf0e81b747fcb7e9e63f2c2b05e26ead973cce62d0ed07d0e0'}[openbao_arch] }}"
+            openbao_seal_type: static
+            openbao_seal_static_current_key_id: molecule-2
+            openbao_seal_static_current_key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') ~ '/static-seal.key') }}"
+            openbao_init_recovery_shares: 1
+            openbao_init_recovery_threshold: 1
+            openbao_init_encrypt_output: false
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-autounseal
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-autounseal
+            openbao_tls_install_ca_to_trust_store: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Seal key change refused.' in ansible_failed_result['msg']"
+              - "\"current_key_id 'molecule-1' -> 'molecule-2'\" in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after_key
+
+    - name: Assert openbao.hcl is unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after_key['stat']['checksum'] == __verify_hcl_before_key['stat']['checksum']
+        fail_msg: openbao.hcl changed during the refused run
+        success_msg: openbao.hcl is byte-identical after the refused key change
+
 # Converge plays 2 and 3: the plugin of the AWS KMS seal, with the GPG check
 # of the archive (default directory) and with the pinned checksum only
 # (/opt/openbao/plugins-pinned). Neither play renders config.
@@ -430,6 +494,244 @@
         success_msg: openbao.hcl still has the static seal and no plugin stanza
       vars:
         __verify_hcl_text: "{{ __verify_hcl_plugins['content'] | b64decode }}"
+
+# The cloud seals are the only ones that run on the external KMS plugin
+# mechanism of 2.7, and the converge plays only install the plugin. This play
+# renders the role's own templates outside the role (role defaults and vars
+# through vars_files, overrides through template_vars) into a scratch config
+# directory and checks them with the installed binary:
+#   1. bao operator validate-config exits 0 (a warning would be rc 2) for the
+#      cloud seals and the other render-only branches (TLS 1.2 only with
+#      client certificates, extra listener, raft and HCL settings)
+#   2. a throwaway second instance with seal "awskms" (own config, data and
+#      audit directories and ports, the role's hardened unit, the role's
+#      openbao.env with the permission check) starts the plugin from
+#      /opt/openbao/plugins: its AWS call fails against an unreachable KMS
+#      endpoint (AWS_KMS_ENDPOINT, which the plugin inherits from the unit
+#      environment), not the plugin start or the permission check.
+- name: KMS plugin - rendered configs validate and the plugin starts
+  hosts: all
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../../defaults/main.yml
+    - ../../vars/main.yml
+  vars:
+    __verify_templates: "{{ lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') }}/templates"
+    __verify_smoke_dir: /etc/openbao-kms-smoke
+    __verify_plugin_sha256: "{{ {'x86_64': '0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76', 'aarch64': '986487f17d30123b4730cf412ad2267f7ef4cfe637c75252ed6d13294673bae2'}[ansible_facts['architecture']] }}"
+    # Shared by every variant: a second instance next to the converged one.
+    __verify_smoke_base:
+      openbao_install_method: binary
+      openbao_config_dir: /etc/openbao-kms-smoke
+      openbao_data_dir: /opt/openbao/kms-smoke/data
+      openbao_audit_dir: /opt/openbao/kms-smoke/audit
+      openbao_listen_address: "127.0.0.1:18200"
+      openbao_cluster_listen_address: "127.0.0.1:18201"
+      openbao_tls_enabled: false
+      openbao_api_addr: "http://127.0.0.1:18200"
+      openbao_cluster_addr: "https://127.0.0.1:18201"
+      openbao_raft_node_id: kms-smoke
+      openbao_raft_peers:
+        - openbao-autounseal
+      __openbao_retry_join_addrs: []
+    __verify_awskms:
+      openbao_seal_type: awskms
+      openbao_seal_awskms_kms_key_id: alias/molecule-smoke
+      openbao_seal_awskms_access_key: AKIAMOLECULESMOKE0000
+      openbao_seal_awskms_secret_key: molecule-smoke-not-a-secret
+      openbao_seal_plugin_checksum: "{{ __verify_plugin_sha256 }}"
+    __verify_variants:
+      - name: awskms
+        vars: "{{ __verify_awskms }}"
+      - name: azurekeyvault
+        vars:
+          openbao_seal_type: azurekeyvault
+          openbao_seal_azurekeyvault_tenant_id: 00000000-0000-0000-0000-000000000000
+          openbao_seal_azurekeyvault_vault_name: molecule-smoke
+          openbao_seal_azurekeyvault_key_name: openbao
+          openbao_seal_azurekeyvault_client_id: 11111111-1111-1111-1111-111111111111
+      - name: gcpckms
+        vars:
+          openbao_seal_type: gcpckms
+          openbao_seal_gcpckms_project: molecule-smoke
+          openbao_seal_gcpckms_region: global
+          openbao_seal_gcpckms_key_ring: openbao
+          openbao_seal_gcpckms_crypto_key: unseal
+          openbao_seal_gcpckms_credentials: /etc/openbao-kms-smoke/gcp.json
+      - name: tls12-client-certs
+        vars:
+          openbao_tls_enabled: true
+          openbao_api_addr: "https://127.0.0.1:18200"
+          openbao_tls_min_version: tls12
+          openbao_tls_max_version: tls12
+          openbao_tls_disable_client_certs: false
+      - name: extras
+        vars:
+          openbao_listener_extra_parameters:
+            x_forwarded_for_authorized_addrs:
+              - 10.0.0.0/8
+            x_forwarded_for_reject_not_authorized: false
+            max_request_duration: 90s
+          openbao_raft_extra_parameters:
+            snapshot_threshold: 8192
+            trailing_logs: 10240
+          openbao_telemetry_unauthenticated_metrics_access: true
+          openbao_extra_config_hcl: |
+            listener "tcp" {
+              address     = "127.0.0.1:18202"
+              tls_disable = true
+            }
+  tasks:
+    - name: Create the directories of the second instance
+      ansible.builtin.file:
+        path: "{{ item['path'] }}"
+        state: directory
+        owner: "{{ item['owner'] }}"
+        group: openbao
+        mode: "0750"
+      loop:
+        - path: /etc/openbao-kms-smoke
+          owner: root
+        - path: /opt/openbao/kms-smoke
+          owner: openbao
+        - path: /opt/openbao/kms-smoke/data
+          owner: openbao
+        - path: /opt/openbao/kms-smoke/audit
+          owner: openbao
+      loop_control:
+        label: "{{ item['path'] }}"
+
+    - name: Render openbao.hcl of every variant with the role template
+      ansible.builtin.copy:
+        content: "{{ lookup('ansible.builtin.template', __verify_templates ~ '/openbao.hcl.j2', template_vars=__verify_smoke_base | combine(item['vars'])) }}"
+        dest: "{{ __verify_smoke_dir }}/{{ item['name'] }}.hcl"
+        owner: openbao
+        group: openbao
+        mode: "0640"
+      loop: "{{ __verify_variants }}"
+      loop_control:
+        label: "{{ item['name'] }}"
+
+    - name: Validate every variant with the installed binary
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/bao
+          - operator
+          - validate-config
+          - "-config={{ __verify_smoke_dir }}/{{ item['name'] }}.hcl"
+      loop: "{{ __verify_variants }}"
+      loop_control:
+        label: "{{ item['name'] }}"
+      register: __verify_validate
+      changed_when: false
+      failed_when: false
+
+    - name: Assert every variant validates without a warning
+      ansible.builtin.assert:
+        that:
+          - item['rc'] == 0
+        fail_msg: "{{ item['item']['name'] }}: rc {{ item['rc'] }}: {{ item['stdout'] }} {{ item['stderr'] }}"
+        success_msg: "{{ item['item']['name'] }} passes bao operator validate-config"
+      loop: "{{ __verify_validate['results'] }}"
+      loop_control:
+        label: "{{ item['item']['name'] }}"
+
+    - name: Install the awskms variant as openbao.hcl of the second instance
+      ansible.builtin.copy:
+        src: "{{ __verify_smoke_dir }}/awskms.hcl"
+        dest: "{{ __verify_smoke_dir }}/openbao.hcl"
+        remote_src: true
+        owner: openbao
+        group: openbao
+        mode: "0640"
+
+    # The role's env file (permission check, AWS credentials) plus an
+    # unreachable KMS endpoint, so the plugin's AWS call fails at once.
+    - name: Render openbao.env of the second instance with the role template
+      ansible.builtin.copy:
+        content: |
+          {{ lookup('ansible.builtin.template', __verify_templates ~ '/openbao.env.j2', template_vars=__verify_smoke_base | combine(__verify_awskms)) }}
+          AWS_KMS_ENDPOINT="http://127.0.0.1:1"
+        dest: "{{ __verify_smoke_dir }}/openbao.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Render the unit of the second instance with the role template
+      ansible.builtin.copy:
+        content: "{{ lookup('ansible.builtin.template', __verify_templates ~ '/openbao.service.j2', template_vars=__verify_smoke_base | combine(__verify_awskms)) }}"
+        dest: /etc/systemd/system/openbao-kms-smoke.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    # Type=notify: the start job fails when the process exits on the seal
+    # error, which is the expected outcome. The unit is new, so its whole
+    # journal belongs to this test.
+    - name: Start the second instance
+      ansible.builtin.systemd_service:
+        name: openbao-kms-smoke
+        state: started
+        daemon_reload: true
+      register: __verify_smoke_start
+      failed_when: false
+
+    - name: Wait for the seal error of the second instance
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - openbao-kms-smoke
+          - --no-pager
+          - -o
+          - cat
+      register: __verify_smoke_journal
+      until: "'Error configuring seal' in __verify_smoke_journal['stdout']"
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Stop the second instance
+      ansible.builtin.systemd_service:
+        name: openbao-kms-smoke
+        state: stopped
+
+    - name: Assert the plugin started and the error came from the AWS call
+      ansible.builtin.assert:
+        that:
+          - "'Error configuring seal \"awskms\"' in __verify_smoke_journal['stdout']"
+          - "'DescribeKey' in __verify_smoke_journal['stdout']"
+          - "'127.0.0.1:1' in __verify_smoke_journal['stdout']"
+          - "'/opt/openbao/plugins/openbao-plugin-kms-aws_0.1.1' in __verify_smoke_journal['stdout']"
+          - "'start plugin client' not in __verify_smoke_journal['stdout']"
+          - "'not owned by' not in __verify_smoke_journal['stdout']"
+          - "'insecure permissions' not in __verify_smoke_journal['stdout']"
+          - "'plugin directory not configured' not in __verify_smoke_journal['stdout']"
+          - "'error while validating the command path' not in __verify_smoke_journal['stdout']"
+          - "'unknown wrapper' not in __verify_smoke_journal['stdout']"
+          - "'checksums did not match' not in __verify_smoke_journal['stdout']"
+        fail_msg: "{{ __verify_smoke_journal['stdout_lines'] | select('search', 'seal|plugin|kms|error') | list | to_json }}"
+        success_msg: the hardened unit started the KMS plugin, which failed only on the unreachable AWS endpoint
+
+    - name: Remove the unit of the second instance
+      ansible.builtin.file:
+        path: /etc/systemd/system/openbao-kms-smoke.service
+        state: absent
+
+    - name: Reload systemd after removing the second instance
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Remove the directories of the second instance
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/openbao-kms-smoke
+        - /opt/openbao/kms-smoke
+      loop_control:
+        label: "{{ item }}"
 
 # Test fixture for the negative plays: a local mirror served through file://
 # URLs. good/ holds the signed checksums.txt of 2.7.3 with a tarball that is

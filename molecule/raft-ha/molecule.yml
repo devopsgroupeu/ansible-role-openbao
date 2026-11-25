@@ -3,8 +3,9 @@
 # 2.7.2, Shamir 1/1, generated TLS with the container names as SANs, init on
 # openbao1, join through retry_join, unseal. verify.yml then upgrades to
 # 2.7.3 with a health-gated rolling restart, refuses a restart that would cost
-# quorum, heals, replaces a node with an empty data directory and checks the
-# peers fallback guard.
+# quorum, heals, converges with one member in maintenance, refuses serial and
+# the free strategy, replaces a node (remove-peer, empty data directory) and
+# checks the peers fallback guard.
 #
 # All three platforms share the named Docker network openbao-raft-ha-net, so
 # the container names resolve through Docker's embedded DNS; openbao_api_addr,

@@ -1,8 +1,10 @@
 ---
 # Single node, full install from the signed package repository: generated
 # TLS, hardened unit, service start, init and unseal, then the day-2 checks
-# (check mode, logrotate, certificate rotation, maintenance stop, in-place
-# change guards, re-init refusal) of spec section 12.2, List B.
+# (check mode, audit device off and on, logrotate, certificate and key
+# rotation, maintenance stop, --check and --tags through roles:, in-place
+# change guards, foreign data directory, blank password file, re-init
+# refusal) of spec section 12.2, List B.
 # Run with: molecule test -s default (MOLECULE_DISTRO=ubuntu2404 or debian13
 # for the other Debian-family images).
 
