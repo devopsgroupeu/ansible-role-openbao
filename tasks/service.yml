@@ -1,0 +1,44 @@
+---
+# ==============================================================================
+# Service (spec section 5.7): enable and start or stop openbao.service.
+# Included by main.yml unless openbao_config_only. Role code never runs
+# systemctl through command; only systemd_service and service_facts.
+# Produces:
+#   __openbao_was_active   the unit was running before this task file
+#   __openbao_started_now  this run started the process (used by the reload
+#                          handler and the restart marker)
+# ==============================================================================
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+  tags: service
+
+- name: Record whether openbao.service was running
+  ansible.builtin.set_fact:
+    __openbao_was_active: "{{ ansible_facts['services']['openbao.service']['state'] | default('') == 'running' }}"
+  tags: service
+
+# daemon_reload picks up a changed unit file; it never reports changed.
+- name: Set the state of openbao.service
+  ansible.builtin.systemd_service:
+    name: openbao
+    state: "{{ openbao_service_state }}"
+    enabled: "{{ openbao_service_enabled | bool }}"
+    daemon_reload: true
+  tags: service
+
+# Keyed on the start transition, not on 'changed': enabling a running unit
+# also reports changed.
+- name: Record whether this run started openbao.service
+  ansible.builtin.set_fact:
+    __openbao_started_now: "{{ not __openbao_was_active | bool and openbao_service_state == 'started' and not ansible_check_mode }}"
+  tags: service
+
+# The process just started with the final config and binary, so a restart
+# recorded earlier in this run (or by an earlier failed run) is satisfied.
+- name: Clear the restart marker after a fresh start
+  ansible.builtin.file:
+    path: "{{ __openbao_restart_marker }}"
+    state: absent
+  when: __openbao_started_now | bool
+  tags: service

@@ -1,0 +1,268 @@
+---
+# ==============================================================================
+# Generate a CA and per-node certificates with community.crypto (ownca).
+# Dev/test only: the CA private key is copied to every node. In production
+# supply BYO files (openbao_tls_generate_certs: false).
+#
+# All nodes must share one CA so that the retry_join TLS handshakes succeed:
+#   1. The bootstrap node (openbao_init_bootstrap_node) generates the CA.
+#   2. Every other node copies the CA certificate and key from the bootstrap
+#      node (slurp) before signing its own node certificate.
+# A certificate change notifies 'reload openbao' (SIGHUP), never a restart.
+# ==============================================================================
+
+# community.crypto needs the Python cryptography library on the target.
+- name: Install the TLS generation dependencies
+  ansible.builtin.package:
+    name: "{{ __openbao_tls_pkg_deps[ansible_facts['os_family']] }}"
+    state: present
+  tags: tls
+
+# Built once, so the CSR and the regeneration check use the same list:
+#   1. shared DNS SAN (leader_tls_servername of every retry_join block)
+#   2. every peer as DNS, and its default IPv4 address when facts are known
+#   3. the host part of openbao_api_addr (the role probes this address)
+#   4. openbao_tls_extra_sans (already prefixed DNS: or IP:)
+#   5. localhost
+- name: Compute the SAN list of the node certificate
+  ansible.builtin.set_fact:
+    __openbao_tls_sans: >-
+      {%- set sans = ['DNS:' ~ openbao_tls_leader_servername] -%}
+      {%- for peer in openbao_raft_peers -%}
+      {%- set _ = sans.append('DNS:' ~ peer) -%}
+      {%- set peer_ipv4 = hostvars[peer]['ansible_facts']['default_ipv4'] | default({}) if hostvars[peer] is defined else {} -%}
+      {%- if peer_ipv4 is mapping and peer_ipv4['address'] is defined -%}
+      {%- set _ = sans.append('IP:' ~ peer_ipv4['address']) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- set api_host = openbao_api_addr | urlsplit('hostname') -%}
+      {%- set _ = sans.append(('IP:' if (api_host is match('^[0-9.]+$') or ':' in api_host) else 'DNS:') ~ api_host) -%}
+      {%- for extra in openbao_tls_extra_sans -%}
+      {%- set _ = sans.append(extra) -%}
+      {%- endfor -%}
+      {%- set _ = sans.append('DNS:localhost') -%}
+      {%- set _ = sans.append('IP:127.0.0.1') -%}
+      {{ sans | unique | list }}
+  tags: tls
+
+# ==============================================================================
+# Step 1: CA on the bootstrap node only.
+# ==============================================================================
+
+- name: Generate the CA private key (ECC) on the bootstrap node
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    type: ECC
+    curve: "{{ openbao_tls_cert_curve }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - openbao_tls_cert_key_type == 'ECC'
+    - inventory_hostname == openbao_init_bootstrap_node
+  tags: tls
+
+- name: Generate the CA private key (RSA) on the bootstrap node
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    type: RSA
+    size: "{{ openbao_tls_cert_size }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - openbao_tls_cert_key_type == 'RSA'
+    - inventory_hostname == openbao_init_bootstrap_node
+  tags: tls
+
+- name: Generate the CA CSR (in memory) on the bootstrap node
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    common_name: "OpenBao Role CA"
+    use_common_name_for_san: false
+    basic_constraints:
+      - "CA:TRUE"
+    basic_constraints_critical: true
+    key_usage:
+      - keyCertSign
+      - cRLSign
+      - digitalSignature
+    key_usage_critical: true
+  register: __openbao_ca_csr
+  changed_when: false
+  when: inventory_hostname == openbao_init_bootstrap_node
+  tags: tls
+
+# x509_certificate ignores timestamps when deciding whether to regenerate, so
+# an expiring CA would never be renewed on its own. Force a new CA
+# certificate (same key) when it expires within 90 days.
+- name: Check the existing CA certificate on the bootstrap node
+  community.crypto.x509_certificate_info:
+    path: "{{ openbao_tls_ca_file }}"
+    valid_at:
+      check: "+90d"
+  register: __openbao_existing_ca
+  failed_when: false
+  changed_when: false
+  when: inventory_hostname == openbao_init_bootstrap_node
+  tags: tls
+
+- name: Generate the CA certificate (self-signed) on the bootstrap node
+  community.crypto.x509_certificate:
+    path: "{{ openbao_tls_ca_file }}"
+    csr_content: "{{ __openbao_ca_csr['csr'] }}"
+    privatekey_path: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    provider: selfsigned
+    selfsigned_not_before: "-1d"
+    selfsigned_not_after: "{{ openbao_tls_cert_validity }}"
+    force: "{{ not (__openbao_existing_ca.get('valid_at', {}).get('check', false) | bool) }}"
+    owner: root
+    group: root
+    mode: "{{ openbao_tls_cert_mode }}"
+  register: __openbao_ca_cert_result
+  when: inventory_hostname == openbao_init_bootstrap_node
+  tags: tls
+
+# ==============================================================================
+# Step 2: copy the shared CA certificate and key to the other nodes.
+# ==============================================================================
+
+- name: Fetch the CA certificate from the bootstrap node
+  ansible.builtin.slurp:
+    src: "{{ openbao_tls_ca_file }}"
+  register: __openbao_ca_cert_b64
+  delegate_to: "{{ openbao_init_bootstrap_node }}"
+  when: inventory_hostname != openbao_init_bootstrap_node
+  tags: tls
+
+- name: Fetch the CA private key from the bootstrap node
+  ansible.builtin.slurp:
+    src: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+  register: __openbao_ca_key_b64
+  delegate_to: "{{ openbao_init_bootstrap_node }}"
+  when: inventory_hostname != openbao_init_bootstrap_node
+  no_log: true
+  tags: tls
+
+- name: Write the shared CA certificate on the other nodes
+  ansible.builtin.copy:
+    content: "{{ __openbao_ca_cert_b64['content'] | b64decode }}"
+    dest: "{{ openbao_tls_ca_file }}"
+    owner: root
+    group: root
+    mode: "{{ openbao_tls_cert_mode }}"
+  register: __openbao_ca_cert_copy
+  when: inventory_hostname != openbao_init_bootstrap_node
+  tags: tls
+
+- name: Write the shared CA private key on the other nodes
+  ansible.builtin.copy:
+    content: "{{ __openbao_ca_key_b64['content'] | b64decode }}"
+    dest: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    owner: root
+    group: root
+    mode: "0600"
+  when: inventory_hostname != openbao_init_bootstrap_node
+  no_log: true
+  tags: tls
+
+# ==============================================================================
+# Step 3: every node signs its own certificate with the shared CA.
+# ==============================================================================
+
+- name: Generate the node private key (ECC)
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_key_file }}"
+    type: ECC
+    curve: "{{ openbao_tls_cert_curve }}"
+    owner: root
+    group: "{{ openbao_group }}"
+    mode: "{{ openbao_tls_key_mode }}"
+  when: openbao_tls_cert_key_type == 'ECC'
+  tags: tls
+
+- name: Generate the node private key (RSA)
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_key_file }}"
+    type: RSA
+    size: "{{ openbao_tls_cert_size }}"
+    owner: root
+    group: "{{ openbao_group }}"
+    mode: "{{ openbao_tls_key_mode }}"
+  when: openbao_tls_cert_key_type == 'RSA'
+  tags: tls
+
+- name: Generate the node CSR (in memory)
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ openbao_tls_key_file }}"
+    common_name: "{{ openbao_tls_leader_servername }}"
+    subject_alt_name: "{{ __openbao_tls_sans }}"
+    use_common_name_for_san: false
+    extended_key_usage:
+      - serverAuth
+      - clientAuth
+    basic_constraints:
+      - "CA:FALSE"
+  register: __openbao_node_csr
+  changed_when: false
+  tags: tls
+
+# The issuing CA as this node sees it, for the issuer check below.
+- name: Read the CA certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ openbao_tls_ca_file }}"
+  register: __openbao_ca_info
+  tags: tls
+
+- name: Check the existing node certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ openbao_tls_cert_file }}"
+    valid_at:
+      check: "+30d"
+  register: __openbao_existing_cert
+  failed_when: false
+  changed_when: false
+  tags: tls
+
+# x509_certificate ignores timestamps and does not notice a renewed or
+# replaced CA, so re-sign when the certificate is missing, expires within 30
+# days, lacks a required SAN, the CA changed in this run, or it was issued by
+# another CA (authority key id differs from the CA's subject key id: a
+# replaced bootstrap node created a new CA and an earlier run stopped before
+# re-signing).
+- name: Decide whether the node certificate needs to be (re)signed
+  ansible.builtin.set_fact:
+    __openbao_regen_cert: >-
+      {{
+        __openbao_existing_cert['failed'] | default(true)
+        or not __openbao_existing_cert.get('valid_at', {}).get('check', false)
+        or __openbao_ca_cert_result is changed
+        or __openbao_ca_cert_copy is changed
+        or __openbao_existing_cert.get('authority_key_identifier') != __openbao_ca_info['subject_key_identifier']
+        or (
+          __openbao_tls_sans | map('regex_replace', '^(DNS|IP|IP Address):', '') | list
+          | difference(
+              __openbao_existing_cert.get('subject_alt_name') | default([], true)
+              | map('regex_replace', '^(DNS|IP|IP Address):', '') | list
+            )
+          | length > 0
+        )
+      }}
+  tags: tls
+
+- name: Sign the node certificate with the shared CA
+  community.crypto.x509_certificate:
+    path: "{{ openbao_tls_cert_file }}"
+    csr_content: "{{ __openbao_node_csr['csr'] }}"
+    ownca_path: "{{ openbao_tls_ca_file }}"
+    ownca_privatekey_path: "{{ openbao_tls_dir }}/openbao-ca-key.pem"
+    provider: ownca
+    ownca_not_before: "-1d"
+    ownca_not_after: "{{ openbao_tls_cert_validity }}"
+    force: true
+    owner: root
+    group: root
+    mode: "{{ openbao_tls_cert_mode }}"
+  when: __openbao_regen_cert | bool
+  notify: reload openbao
+  tags: tls

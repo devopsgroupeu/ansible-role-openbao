@@ -7,6 +7,11 @@
   ansible.builtin.include_tasks: facts.yml
   tags: always
 
+- name: Install OpenBao
+  ansible.builtin.include_tasks: install.yml
+  when: not openbao_config_only | bool
+  tags: install
+
 - name: Render configuration
   ansible.builtin.include_tasks: config.yml
   tags: config
@@ -14,3 +19,13 @@
 - name: Configure TLS
   ansible.builtin.include_tasks: tls.yml
   tags: tls
+
+- name: Manage the OpenBao service
+  ansible.builtin.include_tasks: service.yml
+  when: not openbao_config_only | bool
+  tags: service
+
+# Run pending handlers (certificate reload) before any API call.
+- name: Flush handlers
+  ansible.builtin.meta: flush_handlers
+  when: not openbao_config_only | bool

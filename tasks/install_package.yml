@@ -1,0 +1,106 @@
+---
+# ==============================================================================
+# Install OpenBao from the signed pkgs.openbao.org repository (spec section
+# 5.3). Included by install.yml when openbao_install_method is 'package'.
+# The package name is 'openbao' (the HSM build is discontinued in 2.7).
+# Produces __openbao_pkg_result, the result of the package task of this host's
+# OS family.
+# ==============================================================================
+
+- name: Gather package facts
+  ansible.builtin.package_facts:
+  tags: install
+
+# OpenBao does not support downgrades: the data written by a newer version is
+# not guaranteed to be readable by an older one.
+- name: Refuse a downgrade of the openbao package
+  ansible.builtin.assert:
+    that:
+      - __openbao_installed_version | length == 0 or __openbao_installed_version is version(openbao_version, '<=')
+    fail_msg: >-
+      Downgrade refused.
+      openbao {{ __openbao_installed_version }} is installed on
+      {{ inventory_hostname }} and openbao_version is {{ openbao_version }}.
+      OpenBao does not support downgrades. Set openbao_version to
+      {{ __openbao_installed_version }} or later, or restore a raft snapshot
+      taken with the older version on a fresh install instead.
+    quiet: true
+  vars:
+    __openbao_installed_version: "{{ ansible_facts['packages']['openbao'] | default([]) | map(attribute='version') | first | default('') }}"
+  tags: install
+
+# --- Debian / Ubuntu ----------------------------------------------------------
+
+# The suite is the fixed string 'stable', not the distribution codename.
+- name: Add the OpenBao APT repository (deb822 format)
+  ansible.builtin.deb822_repository:
+    name: openbao
+    types:
+      - deb
+    uris: "{{ openbao_apt_repo_url }}"
+    suites:
+      - stable
+    components:
+      - main
+    architectures:
+      - "{{ openbao_arch }}"
+    signed_by: "{{ __openbao_gpg_key_path }}"
+    state: present
+    enabled: true
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: install
+
+# Exact pin: deb versions are the bare upstream version (2.7.3). No
+# allow_downgrade (guarded above); allow_change_held_packages lets an upgrade
+# replace a held package.
+- name: Install the openbao package (Debian/Ubuntu, exact version pin)
+  ansible.builtin.apt:
+    name: "openbao={{ openbao_version }}"
+    state: present
+    update_cache: true
+    allow_change_held_packages: true
+  register: __openbao_pkg_apt_result
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: install
+
+- name: Set the dpkg selection of the openbao package
+  ansible.builtin.dpkg_selections:
+    name: openbao
+    selection: "{{ 'hold' if openbao_package_hold | bool else 'install' }}"
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: install
+
+# --- RHEL / EL ----------------------------------------------------------------
+
+# A disabled repository is the hold mechanism on EL: the install task below
+# enables it for its own transaction only. Upstream signs packages, not the
+# repository metadata, so repo_gpgcheck stays off.
+- name: Add the OpenBao DNF repository
+  ansible.builtin.yum_repository:
+    name: openbao
+    description: OpenBao
+    baseurl: "{{ openbao_rpm_repo_baseurl }}"
+    gpgcheck: true
+    repo_gpgcheck: false
+    gpgkey: "file://{{ __openbao_gpg_key_path }}"
+    enabled: "{{ not openbao_package_hold | bool }}"
+    state: present
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: install
+
+- name: Install the openbao package (RHEL/EL, exact version pin)
+  ansible.builtin.dnf:
+    name: "openbao-{{ openbao_version }}"
+    state: present
+    disablerepo: "*"
+    enablerepo: openbao
+  register: __openbao_pkg_dnf_result
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: install
+
+# Both package tasks register (a skipped task registers too), so pick the one
+# of this host's OS family.
+- name: Record the package install result
+  ansible.builtin.set_fact:
+    __openbao_pkg_result: "{{ __openbao_pkg_apt_result if ansible_facts['os_family'] == 'Debian' else __openbao_pkg_dnf_result }}"
+  tags: install

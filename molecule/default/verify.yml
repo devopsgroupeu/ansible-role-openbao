@@ -1,0 +1,229 @@
+---
+# Verify for the default scenario (spec section 12.2, List B).
+# The first play checks the converge result: package install with the pinned
+# version and hold, the verified signing key, generated TLS, owners and modes
+# of spec section 7.1, the hardened unit and the running, uninitialized
+# service.
+
+- name: Verify install and service
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Owner, group and mode of every role-managed path (spec section 7.1)
+    # that exists on a Shamir node with generated TLS.
+    __verify_paths:
+      - path: /etc/openbao
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /etc/openbao/openbao.hcl
+        owner: openbao
+        group: openbao
+        mode: "0640"
+      - path: /etc/openbao/openbao.env
+        owner: root
+        group: root
+        mode: "0600"
+      - path: /etc/systemd/system/openbao.service
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /etc/logrotate.d/openbao
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /opt/openbao/data
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/audit
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/tls
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/tls/openbao-key.pem
+        owner: root
+        group: openbao
+        mode: "0640"
+      - path: /opt/openbao/tls/openbao-cert.pem
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /opt/openbao/tls/openbao-ca.pem
+        owner: root
+        group: root
+        mode: "0644"
+      - path: /opt/openbao/tls/openbao-ca-key.pem
+        owner: root
+        group: root
+        mode: "0600"
+      - path: /usr/local/share/openbao
+        owner: root
+        group: root
+        mode: "0755"
+      - path: /usr/local/share/openbao/openbao-signing-key.asc
+        owner: root
+        group: root
+        mode: "0644"
+    # Paths that must not exist on a converged Shamir node.
+    __verify_absent_paths:
+      - /etc/openbao/.ansible-restart-pending
+      - /root/.gnupg
+      - /opt/openbao/plugins
+    # SANs the generated node certificate must carry (spec section 5.6).
+    __verify_sans:
+      - DNS:openbao.cluster.internal
+      - DNS:openbao-default
+      - DNS:localhost
+      - IP:127.0.0.1
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Assert openbao.service is running and enabled
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['openbao.service']['state'] == 'running'
+          - ansible_facts['services']['openbao.service']['status'] == 'enabled'
+        fail_msg: "{{ ansible_facts['services']['openbao.service'] | default('openbao.service not found') | to_json }}"
+        success_msg: openbao.service is running and enabled
+
+    - name: Read the bao version
+      ansible.builtin.command: bao version
+      register: __verify_version
+      changed_when: false
+
+    - name: Assert the pinned version is installed
+      ansible.builtin.assert:
+        that:
+          - "'OpenBao v2.7.3' in __verify_version['stdout']"
+        fail_msg: "{{ __verify_version['stdout'] }}"
+        success_msg: bao reports OpenBao v2.7.3
+
+    - name: Read the dpkg selection of the openbao package
+      ansible.builtin.command: dpkg --get-selections openbao
+      register: __verify_selection
+      changed_when: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Assert the openbao package is held
+      ansible.builtin.assert:
+        that:
+          - __verify_selection['stdout'].split() | last == 'hold'
+        fail_msg: "{{ __verify_selection['stdout'] }}"
+        success_msg: openbao is on hold
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Stat the role-managed paths
+      ansible.builtin.stat:
+        path: "{{ item['path'] }}"
+      loop: "{{ __verify_paths }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+      register: __verify_path_stats
+
+    - name: Assert owner, group and mode of the role-managed paths
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['pw_name'] == item['item']['owner']
+          - item['stat']['gr_name'] == item['item']['group']
+          - item['stat']['mode'] == item['item']['mode']
+        fail_msg: >-
+          {{ item['item']['path'] }}: expected {{ item['item']['owner'] }}:{{ item['item']['group'] }}
+          {{ item['item']['mode'] }}, got {{ item['stat']['pw_name'] | default('-') }}:{{ item['stat']['gr_name'] | default('-') }}
+          {{ item['stat']['mode'] | default('missing') }}
+        success_msg: "{{ item['item']['path'] }} has the expected owner and mode"
+      loop: "{{ __verify_path_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item']['path'] }}"
+
+    - name: Stat the paths that must be absent
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ __verify_absent_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_absent_stats
+
+    - name: Assert the restart marker, /root/.gnupg and the plugin dir are absent
+      ansible.builtin.assert:
+        that:
+          - not item['stat']['exists']
+        fail_msg: "{{ item['item'] }} exists"
+        success_msg: "{{ item['item'] }} is absent"
+      loop: "{{ __verify_absent_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+    - name: Read the node certificate
+      community.crypto.x509_certificate_info:
+        path: /opt/openbao/tls/openbao-cert.pem
+      register: __verify_cert
+
+    - name: Read the CA certificate
+      community.crypto.x509_certificate_info:
+        path: /opt/openbao/tls/openbao-ca.pem
+      register: __verify_ca
+
+    - name: Assert the node certificate SANs and issuer
+      ansible.builtin.assert:
+        that:
+          - __verify_sans | difference(__verify_cert['subject_alt_name'] | map('regex_replace', '^IP Address:', 'IP:') | list) | length == 0
+          - __verify_cert['authority_key_identifier'] == __verify_ca['subject_key_identifier']
+        fail_msg: "{{ __verify_cert['subject_alt_name'] | to_json }}"
+        success_msg: node certificate carries the required SANs and is signed by the CA
+
+    - name: Read the unit properties of openbao.service
+      ansible.builtin.command: systemctl show openbao -p {{ item }} --value  # noqa: command-instead-of-module
+      loop:
+        - ProtectSystem
+        - FragmentPath
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_unit_props
+      changed_when: false
+
+    - name: Assert the role unit is loaded with ProtectSystem=strict
+      ansible.builtin.assert:
+        that:
+          - __verify_unit_props['results'][0]['stdout'] == 'strict'
+          - __verify_unit_props['results'][1]['stdout'] == '/etc/systemd/system/openbao.service'
+        fail_msg: "{{ __verify_unit_props['results'] | map(attribute='stdout') | list | to_json }}"
+        success_msg: the role unit at /etc/systemd/system is loaded with ProtectSystem=strict
+
+    - name: Read openbao.hcl
+      ansible.builtin.slurp:
+        src: /etc/openbao/openbao.hcl
+      register: __verify_hcl_raw
+
+    - name: Assert openbao.hcl has no disable_mlock
+      ansible.builtin.assert:
+        that:
+          - "'disable_mlock' not in (__verify_hcl_raw['content'] | b64decode)"
+        fail_msg: openbao.hcl contains disable_mlock
+        success_msg: openbao.hcl has no disable_mlock
+
+    - name: Read the seal status over TLS
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal
+      until: __verify_seal is succeeded
+      retries: 12
+      delay: 5
+
+    - name: Assert raft storage, the pinned version and an uninitialized node
+      ansible.builtin.assert:
+        that:
+          - __verify_seal['json']['storage_type'] == 'raft'
+          - __verify_seal['json']['version'] == '2.7.3'
+          - not __verify_seal['json']['initialized']
+        fail_msg: "{{ __verify_seal['json'] | to_json }}"
+        success_msg: node answers over TLS, raft storage, 2.7.3, not initialized

@@ -1,0 +1,173 @@
+---
+# ==============================================================================
+# Install (spec section 5.3): dependencies, the verified signing key, the
+# install method, the restart marker after a software change.
+# Included by main.yml unless openbao_config_only.
+# ==============================================================================
+
+- name: Install prerequisite packages (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: "{{ __openbao_pkg_deps['Debian'] }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: install
+
+- name: Install prerequisite packages (RHEL/EL)
+  ansible.builtin.dnf:
+    name: "{{ __openbao_pkg_deps['RedHat'] }}"
+    state: present
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: install
+
+# ==============================================================================
+# Signing key. One flow for every run and every method: the candidate (the
+# installed file, or a fresh download while none is installed) is inspected in
+# a throwaway GnuPG home, so no /root/.gnupg is ever created. The key is
+# installed only when the file holds exactly one key with the pinned primary
+# fingerprint. An installed key is never deleted by the role.
+# ==============================================================================
+
+- name: Stat the installed OpenBao signing key
+  ansible.builtin.stat:
+    path: "{{ __openbao_gpg_key_path }}"
+  register: __openbao_gpg_key_stat
+  tags: install
+
+- name: Create the signing key directory
+  ansible.builtin.file:
+    path: "{{ __openbao_gpg_key_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: install
+
+- name: Verify and install the OpenBao signing key
+  tags: install
+  block:
+    - name: Create a scratch directory for the key verification
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .openbao-gpg
+      register: __openbao_gpg_tmp
+      changed_when: false
+      check_mode: false
+      tags: install
+
+    - name: Download the OpenBao signing key
+      ansible.builtin.get_url:
+        url: "{{ openbao_gpg_key_url }}"
+        dest: "{{ __openbao_gpg_tmp['path'] }}/openbao-signing-key.asc"
+        owner: root
+        group: root
+        mode: "0644"
+      changed_when: false
+      check_mode: false
+      when: not __openbao_gpg_key_stat['stat']['exists']
+      tags: install
+
+    - name: Read the keys in the signing key file
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --homedir
+          - "{{ __openbao_gpg_tmp['path'] }}"
+          - --batch
+          - --show-keys
+          - --with-colons
+          - "{{ __openbao_gpg_key_candidate }}"
+      vars:
+        __openbao_gpg_key_candidate: "{{ __openbao_gpg_key_path if __openbao_gpg_key_stat['stat']['exists'] else __openbao_gpg_tmp['path'] ~ '/openbao-signing-key.asc' }}"
+      register: __openbao_gpg_show
+      changed_when: false
+      check_mode: false
+      tags: install
+
+    # --with-colons: a 'pub' record per primary key, followed directly by its
+    # 'fpr' record (field 10 is the fingerprint).
+    - name: Assert the signing key fingerprint
+      ansible.builtin.assert:
+        that:
+          - __openbao_gpg_pubs | length == 1
+          - __openbao_gpg_found == __openbao_gpg_expected
+        fail_msg: >-
+          OpenBao signing key fingerprint mismatch.
+          {{ __openbao_gpg_show['cmd'] | last }} holds {{ __openbao_gpg_pubs | length }}
+          key(s) with primary fingerprint '{{ __openbao_gpg_found }}'; expected
+          exactly one key with {{ __openbao_gpg_expected }}
+          (openbao_gpg_key_fingerprint). Check openbao_gpg_key_url and
+          openbao_gpg_key_fingerprint. Remove {{ __openbao_gpg_key_path }} only
+          when the upstream key was rotated on purpose; the role never deletes
+          it.
+        quiet: true
+      vars:
+        __openbao_gpg_pubs: "{{ __openbao_gpg_show['stdout_lines'] | select('match', 'pub:') | list }}"
+        __openbao_gpg_expected: "{{ openbao_gpg_key_fingerprint | upper | replace(' ', '') }}"
+        __openbao_gpg_found: >-
+          {%- set ns = namespace(prev='', fpr='') -%}
+          {%- for line in __openbao_gpg_show['stdout_lines'] -%}
+          {%- if ns.prev.startswith('pub:') and line.startswith('fpr:') -%}
+          {%- set ns.fpr = ns.fpr ~ (' ' if ns.fpr else '') ~ line.split(':')[9] -%}
+          {%- endif -%}
+          {%- set ns.prev = line -%}
+          {%- endfor -%}
+          {{ ns.fpr }}
+      tags: install
+
+    - name: Install the verified signing key
+      ansible.builtin.copy:
+        src: "{{ __openbao_gpg_tmp['path'] }}/openbao-signing-key.asc"
+        dest: "{{ __openbao_gpg_key_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      when: not __openbao_gpg_key_stat['stat']['exists']
+      tags: install
+  always:
+    - name: Remove the key verification scratch directory
+      ansible.builtin.file:
+        path: "{{ __openbao_gpg_tmp['path'] }}"
+        state: absent
+      changed_when: false
+      check_mode: false
+      when: __openbao_gpg_tmp['path'] is defined
+      tags: install
+
+# dnf checks package signatures against the RPM database; fingerprint: makes
+# rpm_key refuse any other key.
+- name: Import the OpenBao signing key into the RPM database
+  ansible.builtin.rpm_key:
+    key: "{{ __openbao_gpg_key_path }}"
+    fingerprint: "{{ openbao_gpg_key_fingerprint }}"
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - openbao_install_method == 'package'
+  tags: install
+
+# ==============================================================================
+# Install method
+# ==============================================================================
+
+- name: Install OpenBao from the package repository
+  ansible.builtin.include_tasks: install_package.yml
+  when: openbao_install_method == 'package'
+  tags: install
+
+# Restart intent is a persistent marker (spec section 5.8), written right
+# after the software changed: the running process keeps the old binary until
+# the rolling restart (or the first start in service.yml) replaces it.
+- name: Record a pending restart after a software change
+  ansible.builtin.copy:
+    content: "restart pending\n"
+    dest: "{{ __openbao_restart_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - openbao_install_method == 'package' and __openbao_pkg_result is changed
+    - not ansible_check_mode
+  tags: install

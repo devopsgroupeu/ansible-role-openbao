@@ -1,9 +1,16 @@
 ---
 # ==============================================================================
-# TLS (spec section 5.6): BYO validation and the OS trust store.
-# Every TLS branch is gated on openbao_tls_enabled: with TLS disabled there
-# are no certificate files to check or to trust.
+# TLS (spec section 5.6): generated or BYO certificates, then the OS trust
+# store. Every TLS branch is gated on openbao_tls_enabled: with TLS disabled
+# there are no certificate files to create, check or trust.
 # ==============================================================================
+
+- name: Generate the CA and the node certificate
+  ansible.builtin.include_tasks: tls_generate.yml
+  when:
+    - openbao_tls_enabled | bool
+    - openbao_tls_generate_certs | bool
+  tags: tls
 
 - name: Validate and permission the BYO TLS files
   ansible.builtin.include_tasks: tls_byo.yml

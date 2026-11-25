@@ -1,0 +1,22 @@
+---
+# One listen topic (spec section 5.9). Handlers flush after service.yml, so a
+# process started in this run already loaded the new certificates, and
+# state: reloaded would start a stopped unit (openbao_service_state: stopped).
+# Hence the reload only targets a process that was already running. There is
+# no restart handler: restarts go through the marker and restart.yml.
+
+- name: Gather service facts before the reload
+  ansible.builtin.service_facts:
+  listen: reload openbao
+  when: not openbao_config_only | bool
+
+# SIGHUP reloads the listener certificate without a restart.
+- name: Reload OpenBao
+  ansible.builtin.systemd_service:
+    name: openbao
+    state: reloaded
+  listen: reload openbao
+  when:
+    - not openbao_config_only | bool
+    - ansible_facts['services']['openbao.service']['state'] | default('') == 'running'
+    - not (__openbao_started_now | default(false) | bool)
