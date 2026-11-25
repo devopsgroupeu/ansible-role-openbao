@@ -1,0 +1,108 @@
+---
+# Three-node OpenBao Raft HA cluster for production: signed package install,
+# BYO TLS certificates, 5 Shamir key shares with threshold 3, init output
+# encrypted with Ansible Vault.
+#
+# Inventory (examples/inventory/openbao_cluster.yml):
+#   all:
+#     children:
+#       openbao:
+#         hosts:
+#           openbao1:
+#             ansible_host: 10.0.1.11
+#             openbao_api_addr: "https://10.0.1.11:8200"
+#             openbao_cluster_addr: "https://10.0.1.11:8201"
+#           openbao2:
+#             ansible_host: 10.0.1.12
+#             openbao_api_addr: "https://10.0.1.12:8200"
+#             openbao_cluster_addr: "https://10.0.1.12:8201"
+#           openbao3:
+#             ansible_host: 10.0.1.13
+#             openbao_api_addr: "https://10.0.1.13:8200"
+#             openbao_cluster_addr: "https://10.0.1.13:8201"
+#
+# Pre-requisites:
+#   - Debian 12/13, Ubuntu 24.04 or EL 9 hosts (amd64 or arm64) with sudo and
+#     outbound HTTPS to openbao.org (signing key) and pkgs.openbao.org; ports
+#     8200 (API) and 8201 (cluster) open between the nodes.
+#   - TLS material on every node before the run, for example distributed by a
+#     separate play from your PKI. The role checks that the files exist and
+#     sets their owner and mode (key root:openbao 0640):
+#       /opt/openbao/tls/openbao-cert.pem   server certificate (full chain)
+#       /opt/openbao/tls/openbao-key.pem    private key
+#       /opt/openbao/tls/openbao-ca.pem     CA bundle that issued the certificates
+#     The certificate of each node must carry these SANs:
+#       DNS:openbao.cluster.internal   openbao_tls_leader_servername (retry_join)
+#       IP:<node address>              the host of this node's openbao_api_addr,
+#                                      IP:10.0.1.11 on openbao1 (the role
+#                                      probes each node there)
+#       IP:127.0.0.1                   optional, for the bao CLI on the node
+#     and the extended key usage serverAuth. Add clientAuth when you set
+#     openbao_tls_disable_client_certs: false (the same certificate is then
+#     the retry_join client certificate).
+#   - On the controller: the collections of requirements.yml and an Ansible
+#     Vault password file (mode 0600) that encrypts the init output.
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/openbao_cluster.yml examples/raft_cluster.yml
+#
+# After the run:
+#   - All three nodes are initialized, unsealed, joined as Raft voters and
+#     write the file audit log.
+#   - Init output (root token, 5 unseal keys) on the controller:
+#     ~/.openbao/.openbao_init_openbao-prod.json, mode 0600, encrypted with the
+#     password file. Later runs read it back to unseal restarted nodes and to
+#     run the rolling restart, so keep it (and the password file) on
+#     persistent, access-controlled storage; a CI runner must point
+#     openbao_init_output_path there.
+#       ansible-vault view --vault-password-file ~/.openbao-vault-pass \
+#         ~/.openbao/.openbao_init_openbao-prod.json
+#   - Hand the unseal keys to their holders, set up auth methods and policies,
+#     then revoke the root token (bao token revoke -self). The role never uses it.
+#   - Check the cluster on any node:
+#       export BAO_ADDR=https://10.0.1.11:8200 BAO_CACERT=/opt/openbao/tls/openbao-ca.pem
+#       bao operator raft list-peers
+#   - Upgrades: raise openbao_version and run the playbook against the whole
+#     group. The role restarts one node at a time (leader last) after a quorum
+#     check and waits until each node is unsealed again.
+
+- name: Deploy a three-node OpenBao Raft cluster
+  hosts: openbao
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.openbao
+      vars:
+        # ---- Install ---------------------------------------------------------
+        # Exact version. Changing it later is a health-gated rolling upgrade;
+        # downgrades are refused.
+        openbao_version: "2.7.3"
+
+        # ---- Cluster identity ------------------------------------------------
+        # Stable id in the init file name; keep it once the cluster is initialized.
+        openbao_cluster_id: "openbao-prod"
+
+        # ---- TLS (BYO, the role default) ------------------------------------
+        # openbao_tls_generate_certs stays false: the files listed above must
+        # exist. These are the default paths, repeated for clarity.
+        openbao_tls_cert_file: "/opt/openbao/tls/openbao-cert.pem"
+        openbao_tls_key_file: "/opt/openbao/tls/openbao-key.pem"
+        openbao_tls_ca_file: "/opt/openbao/tls/openbao-ca.pem"
+
+        # ---- Raft ------------------------------------------------------------
+        # openbao_raft_peers defaults to groups['openbao'] (the three nodes of
+        # the inventory); openbao_raft_node_id defaults to inventory_hostname.
+
+        # ---- Init / unseal ---------------------------------------------------
+        # 5 shares, 3 needed to unseal (also the role defaults).
+        openbao_init_key_shares: 5
+        openbao_init_key_threshold: 3
+        # Encrypt the init output in memory before it is written (default).
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ '~/.openbao-vault-pass' | expanduser }}"
+        # Default location; a pipeline points it at persistent storage:
+        # openbao_init_output_path: "/srv/openbao-secrets/.openbao_init_openbao-prod.json"
+
+        # Audit (file device plus logrotate), Prometheus telemetry and the
+        # hardened systemd unit are on by default. The audit device cannot be
+        # changed in place once applied (see docs/TROUBLESHOOTING.md).

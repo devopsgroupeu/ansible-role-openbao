@@ -1,0 +1,125 @@
+---
+# Three-node OpenBao Raft cluster with transit auto-unseal: the nodes unseal
+# themselves at start through the transit secrets engine of a separate,
+# already running OpenBao (or Vault) cluster, the "unsealer".
+#
+# Topology:
+#   Unsealer (separate cluster, must be up whenever a node starts):
+#     URL:           https://unsealer.example.internal:8200 (DNS name or VIP,
+#                    never a single node)
+#     Transit mount: transit/
+#     Transit key:   autounseal
+#   This cluster (examples/inventory/openbao_cluster.yml, shortened):
+#     all:
+#       children:
+#         openbao:
+#           hosts:
+#             openbao1:
+#               ansible_host: 10.0.1.11
+#             openbao2:
+#               ansible_host: 10.0.1.12
+#             openbao3:
+#               ansible_host: 10.0.1.13
+#
+# ==============================================================================
+# Unsealer pre-requisites (run once against the UNSEALER cluster)
+# ==============================================================================
+#
+#   export BAO_ADDR=https://unsealer.example.internal:8200
+#   export BAO_TOKEN=<admin token of the unsealer>
+#
+# 1. Enable the transit secrets engine (skip if it is already enabled):
+#      bao secrets enable transit
+#
+# 2. Create the transit key that wraps this cluster's root key:
+#      bao write -f transit/keys/autounseal
+#
+# 3. Create a policy that only allows encrypt and decrypt with that key:
+#      cat > autounseal-policy.hcl <<'EOF'
+#      path "transit/encrypt/autounseal" {
+#        capabilities = ["update"]
+#      }
+#      path "transit/decrypt/autounseal" {
+#        capabilities = ["update"]
+#      }
+#      EOF
+#      bao policy write autounseal autounseal-policy.hcl
+#
+# 4. Create a periodic orphan token with that policy and no explicit max TTL
+#    (orphan: revoking the parent does not revoke it; periodic: the seal
+#    renews it while a node runs):
+#      bao token create -orphan -period=24h -policy=autounseal \
+#        -display-name=openbao-autounseal
+#    A periodic token that is not renewed within its period expires, for
+#    example when every node is down for longer than that. Then create a new
+#    token with the same policy and update openbao_seal_transit_token.
+#
+# ==============================================================================
+# Pre-requisites on the nodes and the controller
+# ==============================================================================
+#
+#   - TLS: BYO certificates as described in examples/raft_cluster.yml.
+#   - The CA certificate of the unsealer at /opt/openbao/tls/unsealer-ca.pem on
+#     every node, readable by the openbao user (for example root:root 0644).
+#     Drop openbao_seal_transit_tls_ca_cert when the unsealer certificate
+#     chains to the OS trust store.
+#   - Port 8200 of the unsealer reachable from every node.
+#   - The token of step 4 in an Ansible Vault encrypted vars file next to the
+#     inventory, never in the playbook:
+#       ansible-vault create examples/inventory/group_vars/openbao/vault.yml
+#     with the content:
+#       openbao_seal_transit_token: "<token from step 4>"
+#     The role writes it as BAO_TOKEN to /etc/openbao/openbao.env
+#     (root:root 0600) only, never to openbao.hcl, and every task that handles
+#     it runs with no_log.
+#   - An Ansible Vault password file (mode 0600) that encrypts the init output.
+#
+# Usage (--ask-vault-pass opens the vars file above; the init output uses
+# openbao_init_encrypt_password_file):
+#   ansible-playbook -i examples/inventory/openbao_cluster.yml \
+#     examples/autounseal_transit.yml --ask-vault-pass
+#
+# After the run:
+#   - The init output on the controller,
+#     ~/.openbao/.openbao_init_openbao-transit.json (encrypted), holds the root
+#     token and RECOVERY keys, not unseal keys. Recovery keys authorize
+#     operations such as generating a new root token; they cannot unseal.
+#     Without the unsealer, or with its transit key deleted, the cluster
+#     cannot be unsealed at all.
+#   - Revoke the root token once your own auth is set up (bao token revoke -self).
+
+- name: Deploy an OpenBao cluster with transit auto-unseal
+  hosts: openbao
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.openbao
+      vars:
+        # ---- Cluster identity ------------------------------------------------
+        # Stable id in the init file name; keep it once the cluster is initialized.
+        openbao_cluster_id: "openbao-transit"
+
+        # ---- TLS -------------------------------------------------------------
+        # BYO certificates at the default paths (openbao_tls_generate_certs
+        # stays false); see examples/raft_cluster.yml for the SANs.
+
+        # ---- Seal: transit auto-unseal ---------------------------------------
+        # The seal type cannot be changed once the nodes hold data (seal
+        # migration is a manual operation).
+        openbao_seal_type: "transit"
+        openbao_seal_transit_address: "https://unsealer.example.internal:8200"
+        # Key and mount from steps 1 and 2 above (also the role defaults).
+        openbao_seal_transit_key_name: "autounseal"
+        openbao_seal_transit_mount_path: "transit/"
+        openbao_seal_transit_tls_ca_cert: "/opt/openbao/tls/unsealer-ca.pem"
+        # openbao_seal_transit_token comes from the Ansible Vault encrypted
+        # group_vars/openbao/vault.yml (see above); do not set it here.
+
+        # ---- Init ------------------------------------------------------------
+        # Recovery key shares and threshold (also the role defaults).
+        openbao_init_recovery_shares: 5
+        openbao_init_recovery_threshold: 3
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ '~/.openbao-vault-pass' | expanduser }}"
+        # openbao_unseal has no effect with an auto-unseal seal: the nodes
+        # unseal themselves at start, also during the rolling restart.

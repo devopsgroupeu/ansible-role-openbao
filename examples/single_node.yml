@@ -1,0 +1,68 @@
+---
+# Single-node OpenBao for dev/test: signed package install, role-generated
+# TLS, one Shamir key share, init output encrypted with Ansible Vault.
+#
+# Inventory (one host in the group 'openbao'):
+#   all:
+#     children:
+#       openbao:
+#         hosts:
+#           openbao-dev:
+#             ansible_host: 192.0.2.10
+#
+# Pre-requisites:
+#   - Debian 12/13, Ubuntu 24.04 or EL 9 host (amd64 or arm64) with sudo and
+#     outbound HTTPS to openbao.org (signing key) and pkgs.openbao.org.
+#   - On the controller: the collections of requirements.yml
+#     (ansible-galaxy collection install -r requirements.yml) and an Ansible
+#     Vault password file that encrypts the init output:
+#       openssl rand -base64 32 > ~/.openbao-vault-pass
+#       chmod 0600 ~/.openbao-vault-pass
+#
+# Usage:
+#   ansible-playbook -i <inventory with the host above> examples/single_node.yml
+#
+# After the run:
+#   - The node is initialized, unsealed and writes the file audit log.
+#   - Init output (root token and the unseal key) on the controller:
+#     ~/.openbao/.openbao_init_openbao-dev.json, mode 0600, encrypted. Later
+#     runs read it back to unseal a restarted node, so keep both files.
+#       ansible-vault view --vault-password-file ~/.openbao-vault-pass \
+#         ~/.openbao/.openbao_init_openbao-dev.json
+#   - CLI on the node (the generated certificate covers 127.0.0.1):
+#       export BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/opt/openbao/tls/openbao-ca.pem
+#       bao status
+#   - The role never uses the root token: revoke it (bao token revoke -self)
+#     once you have set up your own auth method and policies.
+
+- name: Deploy single-node OpenBao
+  hosts: openbao
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.openbao
+      vars:
+        # ---- Cluster identity ------------------------------------------------
+        # Stable id in the init file name; keep it once the node is initialized.
+        openbao_cluster_id: "openbao-dev"
+
+        # ---- TLS -------------------------------------------------------------
+        # The role creates a CA and the node certificate. Dev/test only: the CA
+        # key lives on the node. Production supplies its own files
+        # (see examples/raft_cluster.yml).
+        openbao_tls_generate_certs: true
+
+        # ---- Init / unseal ---------------------------------------------------
+        # One share is enough for a throwaway node; never use 1/1 in production.
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        # openbao_init_encrypt_output stays true (default): the init output is
+        # encrypted in memory before it is written.
+        openbao_init_encrypt_password_file: "{{ '~/.openbao-vault-pass' | expanduser }}"
+
+        # ---- Logging ---------------------------------------------------------
+        # Human-readable server log for local debugging (default: json).
+        openbao_log_format: "standard"
+
+        # Everything else stays at the role defaults: version 2.7.3, Raft
+        # storage, TLS 1.2+, file audit device with logrotate, hardened unit.

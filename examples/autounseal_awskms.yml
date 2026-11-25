@@ -1,0 +1,119 @@
+---
+# Three-node OpenBao Raft cluster on AWS EC2 with AWS KMS auto-unseal. OpenBao
+# 2.7 ships the cloud seals as external KMS plugins: the role installs the
+# GPG-verified openbao-plugin-kms-aws release into openbao_plugin_dir and
+# declares it in openbao.hcl. Credentials come from the EC2 instance role.
+#
+# Inventory (examples/inventory/openbao_cluster.yml, shortened; EC2 private
+# addresses):
+#   all:
+#     children:
+#       openbao:
+#         hosts:
+#           openbao1:
+#             ansible_host: 10.0.1.11
+#           openbao2:
+#             ansible_host: 10.0.1.12
+#           openbao3:
+#             ansible_host: 10.0.1.13
+#
+# ==============================================================================
+# AWS pre-requisites
+# ==============================================================================
+#
+# 1. A symmetric KMS key in the region of the nodes, for example:
+#      aws kms create-key --region eu-central-1 --description openbao-autounseal
+#    Never schedule it for deletion: without the key the cluster cannot be
+#    unsealed and its data is lost.
+#
+# 2. An instance role (instance profile) on every node whose policy allows
+#    exactly these actions on that key:
+#      {
+#        "Version": "2012-10-17",
+#        "Statement": [
+#          {
+#            "Sid": "OpenBaoAutoUnseal",
+#            "Effect": "Allow",
+#            "Action": [
+#              "kms:Encrypt",
+#              "kms:Decrypt",
+#              "kms:DescribeKey"
+#            ],
+#            "Resource": "arn:aws:kms:eu-central-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+#          }
+#        ]
+#      }
+#    The key policy must let the account delegate to IAM (the default key
+#    policy does) or name the role itself.
+#
+# 3. The nodes reach the KMS endpoint of the region (or a KMS VPC endpoint)
+#    and the instance metadata service.
+#
+# Without an instance role, set openbao_seal_awskms_access_key and
+# openbao_seal_awskms_secret_key in an Ansible Vault encrypted vars file such
+# as examples/inventory/group_vars/openbao/vault.yml (never in the playbook).
+# The role writes them as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY to
+# /etc/openbao/openbao.env (root:root 0600) only.
+#
+# ==============================================================================
+# Pre-requisites on the nodes and the controller
+# ==============================================================================
+#
+#   - TLS: BYO certificates as described in examples/raft_cluster.yml.
+#   - Outbound HTTPS to openbao.org, pkgs.openbao.org and github.com (KMS
+#     plugin release), or mirrors set through openbao_gpg_key_url,
+#     openbao_apt_repo_url (openbao_rpm_repo_baseurl on EL) and
+#     openbao_seal_plugin_base_url.
+#   - An Ansible Vault password file (mode 0600) that encrypts the init output.
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/openbao_cluster.yml examples/autounseal_awskms.yml
+#
+# After the run:
+#   - The plugin runs as /opt/openbao/plugins/openbao-plugin-kms-aws_0.1.1
+#     (owned by openbao, mode 0750) and every node is unsealed by KMS.
+#   - The init output on the controller,
+#     ~/.openbao/.openbao_init_openbao-aws.json (encrypted), holds the root
+#     token and RECOVERY keys. They cannot unseal; KMS does.
+#   - Revoke the root token once your own auth is set up (bao token revoke -self).
+
+- name: Deploy an OpenBao cluster with AWS KMS auto-unseal
+  hosts: openbao
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.openbao
+      vars:
+        # ---- Cluster identity ------------------------------------------------
+        # Stable id in the init file name; keep it once the cluster is initialized.
+        openbao_cluster_id: "openbao-aws"
+
+        # ---- TLS -------------------------------------------------------------
+        # BYO certificates at the default paths (openbao_tls_generate_certs
+        # stays false); see examples/raft_cluster.yml for the SANs.
+
+        # ---- Seal: AWS KMS auto-unseal ---------------------------------------
+        # The seal type cannot be changed once the nodes hold data (seal
+        # migration is a manual operation).
+        openbao_seal_type: "awskms"
+        openbao_seal_awskms_region: "eu-central-1"
+        # Key id, key ARN or alias/<name> of the key from step 1.
+        openbao_seal_awskms_kms_key_id: "arn:aws:kms:eu-central-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        # Empty access and secret keys (the defaults) = use the instance role.
+
+        # ---- KMS plugin ------------------------------------------------------
+        # The release archive is GPG-verified against the pinned OpenBao signing
+        # key (openbao_binary_verify_gpg, default true). Pinning the SHA-256 of
+        # the extracted plugin binary adds a second check and renders it as
+        # sha256sum in the plugin stanza, which OpenBao re-checks before it
+        # runs the plugin. One hash per architecture (checksums-kms-aws.txt of
+        # the release); update the map together with openbao_seal_plugin_version.
+        openbao_seal_plugin_version: "0.1.1"
+        openbao_seal_plugin_checksum: "{{ {'amd64': '0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76', 'arm64': '986487f17d30123b4730cf412ad2267f7ef4cfe637c75252ed6d13294673bae2'}.get(openbao_arch, '') }}"
+
+        # ---- Init ------------------------------------------------------------
+        # Recovery key shares and threshold (the role defaults).
+        openbao_init_recovery_shares: 5
+        openbao_init_recovery_threshold: 3
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ '~/.openbao-vault-pass' | expanduser }}"

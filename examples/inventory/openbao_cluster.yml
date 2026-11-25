@@ -1,0 +1,47 @@
+---
+# Example inventory for a three-node OpenBao Raft HA cluster.
+#
+# The group name 'openbao' is the convention this role relies on:
+# openbao_raft_peers defaults to groups['openbao'], and every node gets one
+# retry_join block per other member. If several hosts sit in a group with
+# another name, each of them would fall back to a single-node cluster;
+# validate.yml refuses that before anything is installed. Use the group name
+# 'openbao' or set openbao_raft_peers.
+#
+# Every node advertises its own API and cluster address. The role default
+# derives both from ansible_facts['default_ipv4']['address']; set them per
+# host when a node has several interfaces or should be reached by DNS name.
+# The server certificate must cover the host of openbao_api_addr (the role
+# probes each node there) and openbao_tls_leader_servername.
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/openbao_cluster.yml examples/raft_cluster.yml
+
+all:
+  children:
+    openbao:
+      hosts:
+        openbao1:
+          ansible_host: 10.0.1.11
+          openbao_api_addr: "https://10.0.1.11:8200"
+          openbao_cluster_addr: "https://10.0.1.11:8201"
+        openbao2:
+          ansible_host: 10.0.1.12
+          openbao_api_addr: "https://10.0.1.12:8200"
+          openbao_cluster_addr: "https://10.0.1.12:8201"
+        openbao3:
+          ansible_host: 10.0.1.13
+          openbao_api_addr: "https://10.0.1.13:8200"
+          openbao_cluster_addr: "https://10.0.1.13:8201"
+      vars:
+        ansible_user: ubuntu
+        ansible_python_interpreter: /usr/bin/python3
+        # Shared DNS SAN every retry_join block verifies (role default).
+        openbao_tls_leader_servername: openbao.cluster.internal
+        # Day-2 runs with --limit (one node at a time) need the API URLs of
+        # all members, exactly as each node's openbao_api_addr; without them
+        # the role refuses with "Cluster members are missing from this play."
+        # openbao_raft_retry_join_api_addrs:
+        #   - "https://10.0.1.11:8200"
+        #   - "https://10.0.1.12:8200"
+        #   - "https://10.0.1.13:8200"
