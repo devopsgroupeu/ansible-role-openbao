@@ -1,0 +1,157 @@
+---
+# ==============================================================================
+# Restart one node (spec section 5.8). Included by restart.yml once per
+# flagged node (loop var __openbao_node), on the first play host only; every
+# task is delegated to __openbao_node. Node-specific values come from
+# hostvars[__openbao_node]; path variables are the same on every member.
+#   1. quorum check: every other member answers sys/health as active or
+#      standby, else nothing is restarted
+#   2-5. restart, wait for the API, unseal (Shamir), health gate: unsealed
+#      with a known leader
+#   6. remove the restart marker
+# A failed check keeps the marker of this node and of every node after it,
+# so the next run restarts them. Both failures are run_once: they stop the
+# play on every host (included tasks do not inherit run_once).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Quorum check, only for an initialized cluster with more than one member.
+# ------------------------------------------------------------------------------
+
+- name: Check the quorum before restarting {{ __openbao_node }}
+  when:
+    - __openbao_cluster_initialized | bool
+    - __openbao_member_api_addrs | length > 1
+  tags: restart
+  block:
+    - name: Check that every other member is healthy
+      ansible.builtin.uri:
+        url: "{{ item }}/v1/sys/health?standbyok=true"
+        validate_certs: true
+        ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+        status_code: 200
+      loop: "{{ __openbao_member_api_addrs | reject('equalto', hostvars[__openbao_node]['__openbao_api_addr']) | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: __openbao_quorum_check
+      until: __openbao_quorum_check is succeeded
+      retries: 6
+      delay: 5
+      check_mode: false
+      delegate_to: "{{ __openbao_node }}"
+      tags: restart
+  rescue:
+    - name: Fail because a member is not healthy
+      ansible.builtin.fail:
+        msg: >-
+          Quorum check failed before restart.
+          Member(s)
+          {{ ansible_failed_result['results'] | default([]) | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='item') | join(', ') }}
+          did not answer sys/health as active or standby (sealed, down or
+          unreachable from {{ __openbao_node }}). Restarting {{ __openbao_node }}
+          now could cost the cluster its quorum, so nothing was restarted. Fix
+          that member and re-run; the pending restarts of
+          {{ __openbao_restart_order[__openbao_node_index:] | join(', ') }}
+          stay recorded (restart marker or version mismatch).
+      run_once: true
+      tags: restart
+
+# ------------------------------------------------------------------------------
+# 2-5. Restart and health gate. A sealed node answers sys/leader with an
+#      error, so a 200 with a leader address means unsealed and joined. For an
+#      uninitialized cluster the gate is the API answering again.
+# ------------------------------------------------------------------------------
+
+- name: Restart and health-check {{ __openbao_node }}
+  tags: restart
+  block:
+    # daemon_reload picks up a unit file change that has not been loaded yet.
+    - name: Restart openbao.service
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: restarted
+        daemon_reload: true
+      delegate_to: "{{ __openbao_node }}"
+      tags: restart
+
+    - name: Wait until the restarted node answers
+      ansible.builtin.uri:
+        url: "{{ hostvars[__openbao_node]['__openbao_api_addr'] }}/v1/sys/seal-status"
+        validate_certs: true
+        ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+        status_code: 200
+      register: __openbao_restart_status
+      until: __openbao_restart_status is succeeded
+      retries: 12
+      delay: 5
+      check_mode: false
+      delegate_to: "{{ __openbao_node }}"
+      tags: restart
+
+    - name: Unseal the restarted node
+      ansible.builtin.uri:
+        url: "{{ hostvars[__openbao_node]['__openbao_api_addr'] }}/v1/sys/unseal"
+        method: POST
+        body_format: json
+        body:
+          key: "{{ item }}"
+        validate_certs: true
+        ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+        status_code: 200
+      loop: "{{ __openbao_unseal_keys[: (__openbao_unseal_threshold | int)] }}"
+      loop_control:
+        index_var: __openbao_key_index
+        label: "key {{ __openbao_key_index }}"
+      changed_when: true
+      no_log: true
+      delegate_to: "{{ __openbao_node }}"
+      when:
+        - openbao_seal_type == 'shamir'
+        - __openbao_can_unseal | bool
+        - __openbao_restart_status['json']['initialized']
+        - __openbao_restart_status['json']['sealed']
+      tags: restart
+
+    - name: Wait until the restarted node is unsealed and sees a leader
+      ansible.builtin.uri:
+        url: "{{ hostvars[__openbao_node]['__openbao_api_addr'] }}/v1/sys/leader"
+        validate_certs: true
+        ca_path: "{{ openbao_tls_ca_file if openbao_tls_enabled | bool else omit }}"
+        status_code: 200
+      register: __openbao_restart_leader
+      until: >-
+        __openbao_restart_leader is succeeded and
+        __openbao_restart_leader['json']['leader_address'] | default('') | length > 0
+      retries: "{{ (openbao_restart_health_timeout | int / 5) | round(0, 'ceil') | int }}"
+      delay: 5
+      check_mode: false
+      delegate_to: "{{ __openbao_node }}"
+      when: __openbao_cluster_initialized | bool
+      tags: restart
+  rescue:
+    - name: Fail because the restarted node is not healthy
+      ansible.builtin.fail:
+        msg: >-
+          Node did not become healthy after restart.
+          Step '{{ ansible_failed_task['name'] | default('unknown') }}' failed
+          for {{ __openbao_node }} ({{ ansible_failed_result['msg'] | default('no further detail') }}).
+          The health gate waits up to {{ openbao_restart_health_timeout }}
+          seconds (openbao_restart_health_timeout) for the node to report
+          unsealed with a known leader. Check journalctl -u openbao on
+          {{ __openbao_node }}, fix the cause, unseal it by hand if needed and
+          re-run. Its restart marker stays, so the next run restarts
+          {{ __openbao_restart_order[__openbao_node_index:] | join(', ') }};
+          the nodes before it are done.
+      run_once: true
+      tags: restart
+
+# ------------------------------------------------------------------------------
+# 6. The node runs the final config and binary.
+# ------------------------------------------------------------------------------
+
+- name: Remove the restart marker of {{ __openbao_node }}
+  ansible.builtin.file:
+    path: "{{ __openbao_restart_marker }}"
+    state: absent
+  delegate_to: "{{ __openbao_node }}"
+  tags: restart

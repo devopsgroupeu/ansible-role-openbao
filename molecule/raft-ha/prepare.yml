@@ -1,0 +1,30 @@
+---
+# Prepare the raft-ha containers before the role runs: bootstrap Python and
+# gather facts. The role installs OpenBao itself from the package repository.
+# The init output is written unencrypted (converge.yml), so no Ansible Vault
+# password file is needed.
+
+- name: Prepare raft-ha containers
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Detect available package manager
+      ansible.builtin.raw: command -v apt-get >/dev/null 2>&1 && echo apt || echo dnf
+      register: __verify_pkg_mgr
+      changed_when: false
+
+    - name: Bootstrap Python (Debian/Ubuntu)
+      ansible.builtin.raw: >-
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends python3 python3-apt
+      changed_when: true
+      when: "'apt' in __verify_pkg_mgr['stdout']"
+
+    - name: Bootstrap Python (RHEL/Rocky)
+      ansible.builtin.raw: >-
+        dnf install -y python3
+      changed_when: true
+      when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+    - name: Gather facts after bootstrap
+      ansible.builtin.setup:

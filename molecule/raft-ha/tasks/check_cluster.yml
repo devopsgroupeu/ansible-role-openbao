@@ -1,0 +1,61 @@
+---
+# Cluster-wide checks with the root token from the init file (verify only;
+# the role never uses a token), run once on the first play host: three raft
+# peers, all voters, exactly one leader, autopilot healthy. Retries cover a
+# node that rejoined or was promoted moments ago. Sets __verify_leader (node
+# id of the raft leader) on every play host.
+# Needs __verify_init (the parsed init output, set in the first verify play).
+
+- name: Wait until raft lists three voters
+  ansible.builtin.command: bao operator raft list-peers -format=json
+  environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+  register: __verify_raft_peers
+  until: >-
+    __verify_raft_peers['rc'] == 0 and
+    (__verify_raft_peers['stdout'] | from_json)['data']['config']['servers'] | selectattr('voter') | list | length == 3
+  retries: 30
+  delay: 5
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: Assert three voters and exactly one leader
+  ansible.builtin.assert:
+    that:
+      - __verify_servers | length == 3
+      - __verify_servers | selectattr('voter') | list | length == 3
+      - __verify_servers | map(attribute='node_id') | sort == ['openbao1', 'openbao2', 'openbao3']
+      - __verify_servers | selectattr('leader') | list | length == 1
+    fail_msg: "{{ __verify_servers | to_json }}"
+    success_msg: >-
+      raft has three voters (openbao1, openbao2, openbao3) and one leader
+      ({{ __verify_servers | selectattr('leader') | map(attribute='node_id') | join(', ') }})
+  run_once: true
+  vars:
+    __verify_servers: "{{ (__verify_raft_peers['stdout'] | from_json)['data']['config']['servers'] }}"
+
+- name: Record the raft leader
+  ansible.builtin.set_fact:
+    __verify_leader: "{{ (__verify_raft_peers['stdout'] | from_json)['data']['config']['servers'] | selectattr('leader') | map(attribute='node_id') | first }}"
+  run_once: true
+
+# The CLI prints the Go struct (field names, no json tags), so the key is
+# 'Healthy'.
+- name: Wait until autopilot reports the cluster healthy
+  ansible.builtin.command: bao operator raft autopilot state -format=json
+  environment: "{{ __verify_bao_env | combine({'BAO_TOKEN': __verify_init['root_token']}) }}"
+  register: __verify_autopilot
+  until: __verify_autopilot['rc'] == 0 and (__verify_autopilot['stdout'] | from_json)['Healthy'] | default(false)
+  retries: 30
+  delay: 5
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: Assert autopilot reports the cluster healthy
+  ansible.builtin.assert:
+    that:
+      - (__verify_autopilot['stdout'] | from_json)['Healthy']
+    fail_msg: "{{ __verify_autopilot['stdout'] }}"
+    success_msg: autopilot reports the cluster healthy
+  run_once: true

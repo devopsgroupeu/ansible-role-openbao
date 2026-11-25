@@ -1,0 +1,18 @@
+---
+# Read the InvocationID and ActiveEnterTimestampMonotonic of openbao.service
+# into __verify_unit ({invocation_id, active_enter}). Every start gets a new
+# InvocationID. The containers share one kernel, so the monotonic timestamps
+# of different nodes are comparable (restart order).
+
+- name: Read the openbao.service unit properties
+  ansible.builtin.command: systemctl show openbao -p InvocationID -p ActiveEnterTimestampMonotonic  # noqa: command-instead-of-module
+  register: __verify_unit_show
+  changed_when: false
+
+- name: Parse the openbao.service unit properties
+  ansible.builtin.set_fact:
+    __verify_unit:
+      invocation_id: "{{ __verify_unit_props['InvocationID'] }}"
+      active_enter: "{{ __verify_unit_props['ActiveEnterTimestampMonotonic'] | int }}"
+  vars:
+    __verify_unit_props: "{{ dict(__verify_unit_show['stdout_lines'] | map('split', '=', 1)) }}"

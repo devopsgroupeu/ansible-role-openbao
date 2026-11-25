@@ -1,0 +1,611 @@
+---
+# Verify for the raft-ha scenario (spec section 12.2, List D), plays 1-7:
+#   1. converge result on every node (2.7.2, initialized, unsealed, no marker)
+#   2. cluster state with the root token; record the leader, the unit state
+#      and a journal cursor per node
+#   3. upgrade to 2.7.3: one health-gated rolling restart, standbys first in
+#      inventory order, the former leader last
+#   4. quorum guard: openbao3 stopped, the role on openbao1 and openbao2
+#      refuses to restart and leaves both nodes untouched with their markers
+#   5. heal: openbao3 back, the pending restarts of play 4 run on all nodes
+#   6. replace node: openbao3 with an empty data directory joins again, no
+#      operator init
+#   7. peers fallback: openbao_raft_peers of one host in a three-host play
+#      fails validate.yml on every node (Review Focus 1)
+# Plays that re-include the role repeat the converge vars (plays do not
+# inherit them) with openbao_version 2.7.3 from play 3 on. The root token is
+# read from the plain init file and used by verify tasks only.
+
+- name: Verify the cluster after converge
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_init_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Assert openbao.service is running and enabled
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['openbao.service']['state'] == 'running'
+          - ansible_facts['services']['openbao.service']['status'] == 'enabled'
+        fail_msg: "{{ ansible_facts['services']['openbao.service'] | default('missing') | to_json }}"
+        success_msg: openbao.service is running and enabled
+
+    - name: Read the seal status
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal
+
+    - name: Assert the node runs 2.7.2, initialized and unsealed
+      ansible.builtin.assert:
+        that:
+          - __verify_seal['json']['initialized']
+          - not __verify_seal['json']['sealed']
+          - __verify_seal['json']['storage_type'] == 'raft'
+          - __verify_seal['json']['type'] == 'shamir'
+          - __verify_seal['json']['version'] == '2.7.2'
+        fail_msg: "{{ __verify_seal['json'] | to_json }}"
+        success_msg: the node runs 2.7.2 over TLS on its container name, initialized and unsealed
+
+    - name: Stat the restart marker
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker
+
+    - name: Assert no restart is pending after converge
+      ansible.builtin.assert:
+        that:
+          - not __verify_marker['stat']['exists']
+        fail_msg: /etc/openbao/.ansible-restart-pending exists after converge
+        success_msg: no restart marker
+
+    - name: Read the init file on the controller
+      ansible.builtin.slurp:
+        src: "{{ __verify_init_file }}"
+      register: __verify_init_raw
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true
+
+    - name: Parse the init output
+      ansible.builtin.set_fact:
+        __verify_init: "{{ __verify_init_raw['content'] | b64decode | from_json }}"
+      run_once: true
+      no_log: true
+
+    - name: Assert the init output holds a root token and one unseal key
+      ansible.builtin.assert:
+        that:
+          - __verify_init['root_token'] | default('') | length > 0
+          - __verify_init['unseal_keys_hex'] | default([], true) | length == 1
+        fail_msg: "init output keys: {{ __verify_init | list | to_json }}"
+        success_msg: the plain init file holds a root token and one unseal key
+      run_once: true
+
+    - name: Record the init file checksum
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+        checksum_algorithm: sha1
+      register: __verify_init_converge
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+- name: Verify the cluster state with the root token
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    # CLI environment for the token-based checks (verify only).
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Check the raft peers and autopilot
+      ansible.builtin.include_tasks: tasks/check_cluster.yml
+
+    - name: Remember the leader before the upgrade
+      ansible.builtin.set_fact:
+        __verify_leader_before: "{{ __verify_leader }}"
+
+    - name: Read the unit state before the upgrade
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Remember the unit state before the upgrade
+      ansible.builtin.set_fact:
+        __verify_unit_before: "{{ __verify_unit }}"
+
+    # The cursor marks the end of the journal; play 3 counts the starts after it.
+    - name: Read the journal cursor before the upgrade
+      ansible.builtin.command: journalctl -u openbao -n 1 --show-cursor --no-pager -o cat
+      register: __verify_journal_cursor
+      changed_when: false
+
+    - name: Remember the journal cursor before the upgrade
+      ansible.builtin.set_fact:
+        __verify_cursor_before: "{{ __verify_journal_cursor['stdout_lines'] | last | regex_replace('^-- cursor: ', '') }}"
+
+    - name: Assert the cursor was read
+      ansible.builtin.assert:
+        that:
+          - __verify_cursor_before is match('^s=')
+        fail_msg: "{{ __verify_journal_cursor['stdout'] }}"
+        success_msg: "leader before the upgrade: {{ __verify_leader_before }}"
+
+- name: Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Include the role with openbao_version 2.7.3
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_version: "2.7.3"
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: false
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-raft-ha
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+        openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+        openbao_tls_install_ca_to_trust_store: false
+
+    - name: Read the seal status after the upgrade
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_upgrade
+
+    - name: Assert the node runs 2.7.3 and is unsealed
+      ansible.builtin.assert:
+        that:
+          - __verify_seal_upgrade['json']['version'] == '2.7.3'
+          - __verify_seal_upgrade['json']['initialized']
+          - not __verify_seal_upgrade['json']['sealed']
+        fail_msg: "{{ __verify_seal_upgrade['json'] | to_json }}"
+        success_msg: the node runs 2.7.3, initialized and unsealed
+
+    - name: Read the unit state after the upgrade
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Remember the unit state after the upgrade
+      ansible.builtin.set_fact:
+        __verify_unit_upgrade: "{{ __verify_unit }}"
+
+    - name: Read the journal since the cursor of play 2
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - openbao
+          - --no-pager
+          - -o
+          - cat
+          - "--after-cursor={{ __verify_cursor_before }}"
+      register: __verify_journal_upgrade
+      changed_when: false
+
+    - name: Assert the node was restarted exactly once
+      ansible.builtin.assert:
+        that:
+          - __verify_unit_upgrade['invocation_id'] != __verify_unit_before['invocation_id']
+          - __verify_starts | length == 1
+        fail_msg: >-
+          InvocationID {{ __verify_unit_before['invocation_id'] }} ->
+          {{ __verify_unit_upgrade['invocation_id'] }}, server starts since the
+          upgrade began: {{ __verify_starts | length }}
+        success_msg: the node was restarted exactly once
+      vars:
+        __verify_starts: "{{ __verify_journal_upgrade['stdout_lines'] | select('search', 'OpenBao server started') | list }}"
+
+    - name: Stat the restart marker after the upgrade
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_upgrade
+
+    - name: Assert no restart is pending after the upgrade
+      ansible.builtin.assert:
+        that:
+          - not __verify_marker_upgrade['stat']['exists']
+        fail_msg: /etc/openbao/.ansible-restart-pending exists after the rolling restart
+        success_msg: no restart marker
+
+    # Restart order: the standbys in inventory order, then the former leader.
+    - name: Assert the restarts ran one at a time with the former leader last
+      ansible.builtin.assert:
+        that:
+          - __verify_times == __verify_times | sort
+          - __verify_times | unique | length == 3
+          - __verify_times | last == __verify_times | max
+        fail_msg: >-
+          restart order {{ __verify_order | join(', ') }} has
+          ActiveEnterTimestampMonotonic {{ __verify_times | join(', ') }}
+        success_msg: "restarted in order {{ __verify_order | join(', ') }}"
+      run_once: true
+      vars:
+        __verify_order: "{{ ansible_play_hosts | reject('equalto', __verify_leader_before) | list + [__verify_leader_before] }}"
+        __verify_times: "{{ __verify_order | map('extract', hostvars, ['__verify_unit_upgrade', 'active_enter']) | list }}"
+
+    - name: Check the raft peers and autopilot after the upgrade
+      ansible.builtin.include_tasks: tasks/check_cluster.yml
+
+# openbao3 is down, so restarting openbao1 or openbao2 could cost quorum. The
+# run fails before any restart and both nodes keep their pending marker
+# (anti-goal 12). The quorum failure stops every host (run_once), so only the
+# host that ran the restart loop has ansible_failed_result.
+- name: Quorum guard
+  hosts: openbao1:openbao2
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Stop openbao.service on openbao3
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: stopped
+      delegate_to: openbao3
+      run_once: true
+
+    - name: Read the unit state before the guarded run
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Remember the unit state before the guarded run
+      ansible.builtin.set_fact:
+        __verify_unit_guard_before: "{{ __verify_unit }}"
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role on two of three members with a config change
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_version: "2.7.3"
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: false
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-raft-ha
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+            openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+            openbao_tls_install_ca_to_trust_store: false
+            # Day-2 run without openbao3 in the play.
+            openbao_raft_retry_join_api_addrs:
+              - https://openbao1:8200
+              - https://openbao2:8200
+              - https://openbao3:8200
+            # A config change, so both nodes need a restart.
+            openbao_log_level: warn
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Record the failure message of this host
+          ansible.builtin.set_fact:
+            __verify_guard_msg: "{{ ansible_failed_result['msg'] | default('') }}"
+
+    - name: Assert the quorum message names the stopped member
+      ansible.builtin.assert:
+        that:
+          - __verify_msgs | length == 1
+          - "'Quorum check failed before restart.' in __verify_msgs[0]"
+          - "'https://openbao3:8200' in __verify_msgs[0]"
+        fail_msg: "{{ __verify_msgs | to_json }}"
+        success_msg: the restart was refused because https://openbao3:8200 is not healthy
+      run_once: true
+      vars:
+        __verify_msgs: "{{ ['openbao1', 'openbao2'] | map('extract', hostvars) | map(attribute='__verify_guard_msg', default='') | select | list }}"
+
+    - name: Read the unit state after the guarded run
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Stat the restart marker after the guarded run
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_guard
+
+    - name: Assert the node was not restarted and the restart stays pending
+      ansible.builtin.assert:
+        that:
+          - __verify_unit['invocation_id'] == __verify_unit_guard_before['invocation_id']
+          - __verify_marker_guard['stat']['exists']
+        fail_msg: >-
+          InvocationID {{ __verify_unit_guard_before['invocation_id'] }} ->
+          {{ __verify_unit['invocation_id'] }}, marker present:
+          {{ __verify_marker_guard['stat']['exists'] }}
+        success_msg: the node kept its process and its restart marker
+
+    # The run_once failure also put the other host on the failed list of this
+    # ansible-playbook run; clear it so the later plays include it.
+    - name: Clear the host errors of the expected failure
+      ansible.builtin.meta: clear_host_errors
+
+# openbao3 starts sealed; the role unseals it, then restarts all three nodes:
+# openbao1 and openbao2 for the markers that survived play 4, openbao3 for its
+# own config change.
+- name: Heal
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Start openbao.service on openbao3
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: started
+      when: inventory_hostname == 'openbao3'
+
+    - name: Read the unit state before the healing run
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Remember the unit state before the healing run
+      ansible.builtin.set_fact:
+        __verify_unit_heal_before: "{{ __verify_unit }}"
+
+    - name: Include the role on all members with the config change
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_version: "2.7.3"
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: false
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-raft-ha
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+        openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+        openbao_tls_install_ca_to_trust_store: false
+        openbao_log_level: warn
+
+    - name: Read the unit state after the healing run
+      ansible.builtin.include_tasks: tasks/read_unit.yml
+
+    - name: Read the seal status after the healing run
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_heal
+
+    - name: Stat the restart marker after the healing run
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_heal
+
+    - name: Assert the node was restarted, is unsealed and has no marker
+      ansible.builtin.assert:
+        that:
+          - __verify_unit['invocation_id'] != __verify_unit_heal_before['invocation_id']
+          - __verify_seal_heal['json']['initialized']
+          - not __verify_seal_heal['json']['sealed']
+          - not __verify_marker_heal['stat']['exists']
+        fail_msg: >-
+          InvocationID {{ __verify_unit_heal_before['invocation_id'] }} ->
+          {{ __verify_unit['invocation_id'] }}, seal status
+          {{ __verify_seal_heal['json'] | to_json }}, marker present:
+          {{ __verify_marker_heal['stat']['exists'] }}
+        success_msg: the pending restart ran, the node is unsealed and no marker is left
+
+    - name: Check the raft peers and autopilot after the healing run
+      ansible.builtin.include_tasks: tasks/check_cluster.yml
+
+# A dead node is replaced by a fresh one with the same inventory name: it
+# joins through retry_join and is unsealed; nothing is initialized again.
+- name: Replace node
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_init_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+    __verify_bao_env:
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /opt/openbao/tls/openbao-ca.pem
+  tasks:
+    - name: Stop openbao.service on openbao3
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: stopped
+      when: inventory_hostname == 'openbao3'
+
+    - name: Find the contents of the openbao3 data directory
+      ansible.builtin.find:
+        paths: /opt/openbao/data
+        file_type: any
+        hidden: true
+      register: __verify_data_entries
+      when: inventory_hostname == 'openbao3'
+
+    - name: Remove the contents of the openbao3 data directory
+      ansible.builtin.file:
+        path: "{{ item['path'] }}"
+        state: absent
+      loop: "{{ __verify_data_entries['files'] }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+      when: inventory_hostname == 'openbao3'
+
+    - name: Find the contents of the openbao3 data directory again
+      ansible.builtin.find:
+        paths: /opt/openbao/data
+        file_type: any
+        hidden: true
+      register: __verify_data_left
+      when: inventory_hostname == 'openbao3'
+
+    - name: Assert the openbao3 data directory is empty
+      ansible.builtin.assert:
+        that:
+          - __verify_data_left['matched'] == 0
+        fail_msg: "{{ __verify_data_left['files'] | map(attribute='path') | list | to_json }}"
+        success_msg: openbao3 has no raft data
+      when: inventory_hostname == 'openbao3'
+
+    - name: Start openbao.service on openbao3 with an empty data directory
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: started
+      when: inventory_hostname == 'openbao3'
+
+    # With retry_join the fresh node fetches the join challenge within
+    # seconds and then reports initialized (and sealed) before it joined.
+    - name: Read the seal status of the empty node
+      ansible.builtin.uri:
+        url: https://openbao3:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_empty
+      until: __verify_seal_empty is succeeded
+      retries: 12
+      delay: 5
+      when: inventory_hostname == 'openbao3'
+
+    - name: Assert openbao3 starts sealed
+      ansible.builtin.assert:
+        that:
+          - __verify_seal_empty['json']['sealed']
+        fail_msg: "{{ __verify_seal_empty['json'] | to_json }}"
+        success_msg: openbao3 started sealed with an empty data directory
+      when: inventory_hostname == 'openbao3'
+
+    - name: Include the role on all members
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_version: "2.7.3"
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: false
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-raft-ha
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+        openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+        openbao_tls_install_ca_to_trust_store: false
+        openbao_log_level: warn
+
+    - name: Read the seal status after the replacement
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_replace
+
+    - name: Assert the node is initialized and unsealed
+      ansible.builtin.assert:
+        that:
+          - __verify_seal_replace['json']['initialized']
+          - not __verify_seal_replace['json']['sealed']
+        fail_msg: "{{ __verify_seal_replace['json'] | to_json }}"
+        success_msg: the node is initialized and unsealed
+
+    - name: Record the init file checksum after the replacement
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+        checksum_algorithm: sha1
+      register: __verify_init_replace
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Assert no operator init ran
+      ansible.builtin.assert:
+        that:
+          - __verify_init_replace['stat']['checksum'] == __verify_init_converge['stat']['checksum']
+        fail_msg: the init file changed during the replacement
+        success_msg: the init file is byte-identical, so the cluster was not initialized again
+      run_once: true
+
+    - name: Check the raft peers and autopilot after the replacement
+      ansible.builtin.include_tasks: tasks/check_cluster.yml
+
+# An inventory group not named 'openbao' makes openbao_raft_peers fall back to
+# [inventory_hostname] on every host; validate.yml must stop all of them
+# before anything changes (Review Focus 1).
+- name: Negative - peers fallback
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with a single-host peers list on every host
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_version: "2.7.3"
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: false
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-raft-ha
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://{{ inventory_hostname }}:8200"
+            openbao_cluster_addr: "https://{{ inventory_hostname }}:8201"
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_log_level: warn
+            # What the default falls back to without an 'openbao' group.
+            openbao_raft_peers: "{{ [inventory_hostname] }}"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Invalid openbao_raft_peers.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Read the seal status after the refused run
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:8200/v1/sys/seal-status"
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_fallback
+
+    - name: Assert nothing changed
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+          - __verify_seal_fallback['json']['initialized']
+          - not __verify_seal_fallback['json']['sealed']
+        fail_msg: >-
+          openbao.hcl checksum {{ __verify_hcl_before['stat']['checksum'] }} ->
+          {{ __verify_hcl_after['stat']['checksum'] }}, seal status
+          {{ __verify_seal_fallback['json'] | to_json }}
+        success_msg: validate.yml refused the run and openbao.hcl is byte-identical

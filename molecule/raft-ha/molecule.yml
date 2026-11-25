@@ -1,0 +1,100 @@
+---
+# Three-node Raft HA cluster (spec section 12.2, List D): package install of
+# 2.7.2, Shamir 1/1, generated TLS with the container names as SANs, init on
+# openbao1, join through retry_join, unseal. verify.yml then upgrades to
+# 2.7.3 with a health-gated rolling restart, refuses a restart that would cost
+# quorum, heals, replaces a node with an empty data directory and checks the
+# peers fallback guard.
+#
+# All three platforms share the named Docker network openbao-raft-ha-net, so
+# the container names resolve through Docker's embedded DNS; openbao_api_addr,
+# openbao_cluster_addr and the retry_join addresses use them. The network is
+# declared under each platform, so the driver creates it before the first
+# container starts and removes it on destroy.
+#
+# The test sequence includes idempotence: a second converge must report
+# changed=0 on all three nodes (spec section 9).
+# Run with: molecule test -s raft-ha
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: openbao1
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - openbao
+    networks:
+      - name: openbao-raft-ha-net
+
+  - name: openbao2
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - openbao
+    networks:
+      - name: openbao-raft-ha-net
+
+  - name: openbao3
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - openbao
+    networks:
+      - name: openbao-raft-ha-net
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - verify
+    - cleanup
+    - destroy

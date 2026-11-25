@@ -37,3 +37,12 @@
     - not openbao_config_only | bool
     - openbao_service_state == 'started'
   tags: init_unseal
+
+# Health-gated rolling restart of the nodes with a pending restart marker or
+# a running version other than openbao_version.
+- name: Restart OpenBao nodes one at a time
+  ansible.builtin.include_tasks: restart.yml
+  when:
+    - not openbao_config_only | bool
+    - openbao_service_state == 'started'
+  tags: restart

@@ -1,0 +1,81 @@
+---
+# ==============================================================================
+# Rolling restart (spec section 5.8). Included by main.yml unless
+# openbao_config_only, and only while openbao_service_state is started; also
+# runs on its own with --tags restart. A node needs a restart when its restart
+# marker exists (config, unit, package or binary change) or when the version
+# it runs differs from openbao_version. The flagged nodes restart one at a
+# time from a run_once loop: the standbys in inventory order, the leader last.
+# restart_node.yml checks quorum before and health after each node.
+# Check mode: lists the nodes that would be restarted, restarts nothing.
+# Produces:
+#   __openbao_restart_required  this node needs a restart
+#   __openbao_restart_order     flagged nodes, leader last (same on every host)
+# ==============================================================================
+
+# Fresh status: the probe in init_unseal.yml predates the unseal.
+- name: Probe the OpenBao nodes before the restart
+  ansible.builtin.include_tasks: probe.yml
+  tags: restart
+
+- name: Stat the restart marker
+  ansible.builtin.stat:
+    path: "{{ __openbao_restart_marker }}"
+  register: __openbao_restart_marker_stat
+  tags: restart
+
+- name: Record whether this node needs a restart
+  ansible.builtin.set_fact:
+    __openbao_restart_required: >-
+      {{ __openbao_restart_marker_stat['stat']['exists']
+         or __openbao_seal_status['version'] | default('') != openbao_version }}
+  tags: restart
+
+# Always (re)loaded, not only when undefined: facts persist across the plays
+# of one run, so keys of an earlier include could belong to other settings.
+- name: Load the unseal keys
+  ansible.builtin.include_tasks: load_keys.yml
+  tags: restart
+
+# Same rule as in init_unseal.yml, set again for a --tags restart run.
+- name: Record whether the role can unseal a restarted node
+  ansible.builtin.set_fact:
+    __openbao_can_unseal: "{{ openbao_seal_type != 'shamir' or (openbao_unseal | bool and __openbao_unseal_keys | length > 0) }}"
+  tags: restart
+
+- name: Order the restarts with the leader last
+  ansible.builtin.set_fact:
+    __openbao_restart_order: >-
+      {%- set ns = namespace(standbys=[], leaders=[]) -%}
+      {%- for host in ansible_play_hosts if hostvars[host]['__openbao_restart_required'] | bool -%}
+      {%- if hostvars[host]['__openbao_is_leader'] | bool -%}
+      {%- set ns.leaders = ns.leaders + [host] -%}
+      {%- else -%}
+      {%- set ns.standbys = ns.standbys + [host] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.standbys + ns.leaders }}
+  run_once: true
+  tags: restart
+
+- name: Report the nodes that would be restarted
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: would restart
+      {{ __openbao_restart_order | join(', ') if __openbao_restart_order | length > 0 else 'no node' }}
+      (standbys first, leader last).
+  run_once: true
+  when: ansible_check_mode
+  tags: restart
+
+# run_once: the included tasks run once per node, on the first play host,
+# and delegate every action to the node being restarted.
+- name: Restart the flagged nodes one at a time
+  ansible.builtin.include_tasks: restart_node.yml
+  loop: "{{ __openbao_restart_order }}"
+  loop_control:
+    loop_var: __openbao_node
+    index_var: __openbao_node_index
+  run_once: true
+  when: not ansible_check_mode
+  tags: restart
