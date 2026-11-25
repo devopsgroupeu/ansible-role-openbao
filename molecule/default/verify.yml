@@ -7,12 +7,14 @@
 # controller, the declarative audit device and that no secret leaks into
 # openbao.hcl or the journal, using the root token from the init file. With
 # that token the audit device is disabled (the node must become active
-# again) and enabled again. Then the root token is revoked and every later
-# play runs the role without it (Review Focus 2). The day-2 plays follow:
-# wrong Ansible Vault password, logrotate, certificate rotation (Review
-# Focus 5), a replaced node key, maintenance stop and start (Review Focus 3),
-# check mode and --tags through a static roles: entry (static_role.yml as a
-# separate ansible-playbook process), the three in-place change guards, the
+# again), its directory moved and the device enabled again. Then the root
+# token is revoked and every later play runs the role without it (Review
+# Focus 2). The day-2 plays follow: wrong Ansible Vault password, logrotate,
+# certificate rotation (Review Focus 5), a replaced node key, maintenance
+# stop and start (Review Focus 3), check mode and --tags through a static
+# roles: entry (static_role.yml as a separate ansible-playbook process), the
+# in-place change guards (audit device, audit directory, seal type, raft
+# node id), the
 # restart refusal without unseal keys, a data directory of another storage
 # backend and, last, the blank password file and re-init refusals, which
 # leave the data directory empty. Plays that re-include the role repeat the
@@ -412,8 +414,9 @@
 # change) with the hardened unit: the restarted node must become active
 # again. OpenBao opens every device of the replicated audit table at unseal
 # before it removes the ones no longer declared, so the audit directory must
-# stay writable (ReadWritePaths). Then the device is enabled again with the
-# converge values (a new device with a new HMAC salt).
+# stay writable (ReadWritePaths). With the device gone, openbao_audit_dir
+# moves (review round 2); then the device is enabled again with the converge
+# values (a new device with a new HMAC salt, back in the default directory).
 - name: Audit device disabled and enabled again
   hosts: all
   become: true
@@ -477,6 +480,54 @@
           {{ __verify_health_audit_off['json'] | to_json }}, audit list
           rc {{ __verify_audit_list_off['rc'] }}: {{ __verify_audit_list_off['stdout'] }}
         success_msg: the node is active again without an audit device and the audit directory stayed writable
+
+    # Second step of the documented directory change: with the device gone
+    # (no openbao.hcl declares it) the directory may move; the restarted node
+    # opens no stored device and becomes active.
+    - name: Include the role with the device gone and a new audit directory
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-default
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_peers:
+          - openbao-default
+        openbao_tls_install_ca_to_trust_store: false
+        openbao_audit_enabled: false
+        openbao_audit_dir: /opt/openbao/audit-moved
+        openbao_restart_health_timeout: 60
+
+    - name: Read the write paths after the audit directory change
+      ansible.builtin.command: systemctl show openbao -p ReadWritePaths --value  # noqa: command-instead-of-module
+      register: __verify_rw_paths_moved
+      changed_when: false
+
+    - name: Read sys/health after the audit directory change
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/health
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_health_moved
+
+    - name: Assert the node is active with the new audit directory
+      ansible.builtin.assert:
+        that:
+          - "'/opt/openbao/audit-moved' in __verify_rw_paths_moved['stdout'].split()"
+          - "'/opt/openbao/audit' not in __verify_rw_paths_moved['stdout'].split()"
+          - not __verify_health_moved['json']['sealed']
+          - not __verify_health_moved['json']['standby']
+        fail_msg: >-
+          ReadWritePaths {{ __verify_rw_paths_moved['stdout'] }}, health
+          {{ __verify_health_moved['json'] | to_json }}
+        success_msg: the audit directory moved once the device was gone and the node is active
 
     - name: Include the role with the audit device enabled again
       ansible.builtin.include_role:
@@ -1310,6 +1361,74 @@
           - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
         fail_msg: openbao.hcl changed during the failed run
         success_msg: openbao.hcl is byte-identical after the failed run
+
+# Disabling the device and moving openbao_audit_dir in one run (review
+# round 2): the stored device would sit outside ReadWritePaths of the new
+# unit, and every restarted node opens it at unseal. Refused before anything
+# is rendered, so openbao.hcl and the unit stay byte-identical.
+- name: Negative - audit directory change with the device disabled
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl and unit checksums before the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /etc/openbao/openbao.hcl
+        - /etc/systemd/system/openbao.service
+      register: __verify_auditdir_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the device disabled and a new audit directory
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-default
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+            openbao_audit_enabled: false
+            openbao_audit_dir: /opt/openbao/audit-moved
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Audit directory change refused.' in ansible_failed_result['msg']"
+              - "'/opt/openbao/audit/openbao_audit.log' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl and unit checksums after the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /etc/openbao/openbao.hcl
+        - /etc/systemd/system/openbao.service
+      register: __verify_auditdir_after
+
+    - name: Assert openbao.hcl and the unit are unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_auditdir_after['results'] | map(attribute='stat.checksum') | list == __verify_auditdir_before['results'] | map(attribute='stat.checksum') | list
+        fail_msg: openbao.hcl or openbao.service changed during the failed run
+        success_msg: openbao.hcl and openbao.service are byte-identical after the failed run
 
 - name: Negative - seal type change
   hosts: all
