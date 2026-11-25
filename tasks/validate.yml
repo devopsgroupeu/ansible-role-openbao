@@ -189,23 +189,29 @@
 
 # --- Cross-variable -----------------------------------------------------------
 
-# Rule 12. The last condition catches an inventory group not named 'openbao':
-# the peers default falls back to [inventory_hostname] and every play host
-# would initialize its own single-node cluster. ansible_play_hosts_all also
-# counts hosts that already failed in this play.
+# Rule 12. The last condition makes the play one cluster and nothing else:
+# the cluster-wide tasks aggregate the facts of all play hosts and store the
+# init output, load the keys and order the restarts from run_once tasks, so a
+# second cluster in the play, or a host that skips the role (a role-level
+# when), would be mixed in or break them. It also catches an inventory group
+# not named 'openbao': the peers default falls back to [inventory_hostname]
+# and every play host would initialize its own single-node cluster.
+# ansible_play_hosts_all also counts hosts that already failed in this play.
 - name: Validate openbao_raft_peers
   ansible.builtin.assert:
     that:
       - openbao_raft_peers | length > 0
       - inventory_hostname in openbao_raft_peers
-      - not (ansible_play_hosts_all | length > 1 and openbao_raft_peers | length == 1)
+      - ansible_play_hosts_all | difference(openbao_raft_peers) | length == 0
     fail_msg: >-
       Invalid openbao_raft_peers.
-      Got {{ openbao_raft_peers }} on {{ inventory_hostname }}
-      ({{ ansible_play_hosts_all | length }} host(s) in this play). The list
-      must name every cluster member and contain this host. Name the inventory
-      group 'openbao' or set openbao_raft_peers explicitly; run independent
-      single nodes in separate plays.
+      Got {{ openbao_raft_peers }} on {{ inventory_hostname }}; play hosts
+      outside this list: {{ ansible_play_hosts_all | difference(openbao_raft_peers) | sort | join(', ') or 'none' }}.
+      The list must name every cluster member and contain this host, and
+      every host of the play must be one of them: one cluster per play and no
+      other hosts (no role-level when). Name the inventory group 'openbao' or
+      set openbao_raft_peers explicitly, and run each cluster, and each
+      independent single node, in its own play (hosts: <its group>).
     quiet: true
   tags: always
 

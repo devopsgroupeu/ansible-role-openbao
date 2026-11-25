@@ -120,7 +120,9 @@ argument_specs:
         type: str
         required: false
         default: "/opt/openbao/audit"
-        description: Audit log directory; the audit file must be inside it.
+        description: >
+          Audit log directory; the audit file must be inside it. Refused to move
+          while an existing openbao.hcl still declares the audit device.
 
       openbao_plugin_dir:
         type: str
@@ -315,7 +317,9 @@ argument_specs:
         elements: str
         required: false
         default: "{{ groups['openbao'] | default([inventory_hostname]) }}"
-        description: Inventory names of all cluster members.
+        description: >
+          Inventory names of all cluster members. Every play host must be one of
+          them (one cluster per play).
 
       openbao_raft_retry_join_api_addrs:
         type: list

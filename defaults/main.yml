@@ -65,7 +65,9 @@ openbao_data_dir: "/opt/openbao/data"
 # Directory for TLS material (certificate, key, CA).
 openbao_tls_dir: "/opt/openbao/tls"
 
-# Audit log directory; openbao_audit_file_path must be inside it.
+# Audit log directory; openbao_audit_file_path must be inside it. Move it only
+# after the device was removed (openbao_audit_enabled: false applied to the
+# whole cluster); the role refuses to move it while openbao.hcl declares one.
 openbao_audit_dir: "/opt/openbao/audit"
 
 # External plugin directory. Created and configured only for the cloud KMS
@@ -181,8 +183,9 @@ openbao_tls_install_ca_to_trust_store: true
 # node that already holds raft data.
 openbao_raft_node_id: "{{ inventory_hostname }}"
 
-# Inventory names of all cluster members. Defaults to the 'openbao' group;
-# validate.yml fails when several play hosts would each fall back to a
+# Inventory names of all cluster members. Defaults to the 'openbao' group.
+# Every play host must be in it (one cluster per play); validate.yml fails
+# otherwise, also when several play hosts would each fall back to a
 # single-node cluster (inventory group not named 'openbao').
 openbao_raft_peers: "{{ groups['openbao'] | default([inventory_hostname]) }}"
 

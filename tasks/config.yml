@@ -49,6 +49,8 @@
 #   __openbao_audit_old_block   text between the audit markers of the existing
 #   __openbao_audit_new_block   openbao.hcl and of audit.hcl.j2 rendered now,
 #                               whitespace-normalized ('' if absent)
+#   __openbao_audit_old_file_path  file_path of the device in the old block
+#                               ('' if none)
 # ==============================================================================
 
 - name: Read the settings of the existing node
@@ -116,6 +118,12 @@
              | regex_search(__openbao_audit_markers_re, '\1')
              | default([''], true) | first
              | regex_replace('\s+', ' ') | trim }}
+        __openbao_audit_old_file_path: >-
+          {{ __openbao_old_hcl_text
+             | regex_search(__openbao_audit_markers_re, '\1')
+             | default([''], true) | first
+             | regex_search('file_path\s*=\s*"([^"]*)"', '\1')
+             | default([''], true) | first }}
         __openbao_audit_new_block: >-
           {{ lookup('ansible.builtin.template', 'audit.hcl.j2')
              | regex_search(__openbao_audit_markers_re, '\1')
@@ -218,6 +226,39 @@
   when: not openbao_config_only | bool
   tags: config
 
+# The unit keeps only openbao_audit_dir writable (ProtectSystem=strict), but
+# every node opens each device of the replicated audit table when it unseals,
+# before it removes the devices no longer declared (upstream setupAudits runs
+# before handleAuditLogSetup). So while the existing openbao.hcl of a play
+# host declares the device, its file must stay inside this host's
+# openbao_audit_dir, also with openbao_audit_enabled: false. Runs before the
+# in-place guard, which a directory change would hit too, so the message
+# names the directory.
+- name: Refuse an audit directory change while the device is declared
+  ansible.builtin.assert:
+    that:
+      - __openbao_audit_paths_outside | length == 0
+    fail_msg: >-
+      Audit directory change refused.
+      The existing openbao.hcl of a play host declares an audit device that
+      writes to {{ __openbao_audit_paths_outside | join(', ') }}, outside
+      openbao_audit_dir '{{ openbao_audit_dir }}' of {{ inventory_hostname }}.
+      Every node opens the stored device when it unseals, before it removes a
+      device that is no longer declared, and the unit keeps only
+      openbao_audit_dir writable, so the restarted nodes would fail their
+      post-unseal setup. First set openbao_audit_enabled: false with
+      openbao_audit_dir unchanged and apply it to the whole cluster until bao
+      audit list no longer shows the device; then change openbao_audit_dir
+      and enable the device again.
+    quiet: true
+  vars:
+    __openbao_audit_paths_outside: >-
+      {{ ansible_play_hosts | map('extract', hostvars, '__openbao_audit_old_file_path')
+         | select | reject('match', (openbao_audit_dir ~ '/') | regex_escape)
+         | unique | list }}
+  when: not openbao_config_only | bool
+  tags: config
+
 # Cluster-wide: OpenBao replicates the audit table, so the old devices of all
 # play hosts and the new settings of all play hosts must agree. Blocks
 # without a device are ignored, so adding a device (no old stanza anywhere)
@@ -233,7 +274,8 @@
       declare {{ __openbao_audit_blocks | length }} different audit devices
       (whitespace-normalized): {{ __openbao_audit_blocks | join(' <> ') }}.
       OpenBao refuses a changed declarative audit device at the next unseal.
-      Set openbao_audit_enabled: false and apply it to the whole cluster, then
+      Set openbao_audit_enabled: false, with openbao_audit_dir and the other
+      audit settings unchanged, and apply it to the whole cluster, then
       re-enable the device with the new values (this creates a new device
       with a new HMAC salt). The guard sees only the hosts in this play.
     quiet: true

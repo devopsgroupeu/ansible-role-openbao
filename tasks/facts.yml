@@ -14,8 +14,8 @@
 # The cluster-wide tasks read other hosts' facts through hostvars and drive
 # the rolling restart from run_once tasks, which needs the linear strategy
 # with all members in one batch. Under linear this run_once task runs on the
-# first member in play order (every play host that runs the role is a member,
-# validate.yml rule 12). Under the free strategy run_once is ignored and it
+# first member in play order (every play host is a member, validate.yml
+# rule 12). Under the free strategy run_once is ignored and it
 # runs on every host, so every other member fails; with serial the batch is
 # smaller than the play.
 - name: Validate the play strategy and batch size
