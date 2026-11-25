@@ -1,0 +1,791 @@
+---
+# Verify for the autounseal scenario (spec section 12.2, List C).
+# The first play checks the converge result: the verified release binary at
+# /usr/local/bin/bao (no package), the service user created by the role,
+# owners and modes, a node that is initialized and auto-unsealed by the
+# static seal, recovery keys and no unseal keys in the init output, no secret
+# in openbao.hcl or the journal, no GnuPG leftovers. "Converge config change"
+# proves that a config change restarts the node exactly once and that it
+# comes back unsealed without unseal keys. Then the two KMS plugin installs
+# of converge.yml are checked. The negative plays feed tampered release files
+# from a local file:// mirror to the binary and plugin verification, refuse a
+# downgrade and an unverified plugin download, and check that the failed runs
+# left nothing behind. The last play refuses a wrong signing key fingerprint.
+
+- name: Verify binary install and auto-unseal
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_init_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+    __verify_static_key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') ~ '/static-seal.key') }}"
+    # Owner, group and mode of the role-managed paths of a binary install
+    # (spec section 7.1): no package postinst created any of them.
+    __verify_paths:
+      - path: /usr/local/bin/bao
+        owner: root
+        group: root
+        mode: "0755"
+      - path: /etc/openbao
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /etc/openbao/openbao.hcl
+        owner: openbao
+        group: openbao
+        mode: "0640"
+      - path: /etc/openbao/openbao.env
+        owner: root
+        group: root
+        mode: "0600"
+      - path: /opt/openbao/data
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/audit
+        owner: openbao
+        group: openbao
+        mode: "0750"
+      - path: /opt/openbao/tls
+        owner: root
+        group: openbao
+        mode: "0750"
+      - path: /usr/local/share/openbao/openbao-signing-key.asc
+        owner: root
+        group: root
+        mode: "0644"
+    # Paths that must not exist after a converged binary install.
+    __verify_absent_paths:
+      - /usr/bin/bao
+      - /etc/openbao/.ansible-restart-pending
+      - /root/.gnupg
+  tasks:
+    - name: Read the bao version
+      ansible.builtin.command: /usr/local/bin/bao version
+      register: __verify_version
+      changed_when: false
+
+    - name: Assert the pinned version is installed
+      ansible.builtin.assert:
+        that:
+          - "'OpenBao v2.7.3' in __verify_version['stdout']"
+        fail_msg: "{{ __verify_version['stdout'] }}"
+        success_msg: /usr/local/bin/bao reports OpenBao v2.7.3
+
+    - name: Gather package facts
+      ansible.builtin.package_facts:
+
+    - name: Assert no openbao package is installed
+      ansible.builtin.assert:
+        that:
+          - "'openbao' not in ansible_facts['packages']"
+        fail_msg: "{{ ansible_facts['packages']['openbao'] | default([]) | to_json }}"
+        success_msg: the binary method installed no package
+
+    - name: Read the openbao user
+      ansible.builtin.getent:
+        database: passwd
+        key: openbao
+
+    - name: Read the openbao group
+      ansible.builtin.getent:
+        database: group
+        key: openbao
+
+    - name: Assert the service user and group created by the role
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['getent_passwd']['openbao'][4] == '/opt/openbao'
+          - ansible_facts['getent_passwd']['openbao'][5] == '/bin/false'
+          - ansible_facts['getent_passwd']['openbao'][2] == ansible_facts['getent_group']['openbao'][1]
+        fail_msg: "{{ ansible_facts['getent_passwd']['openbao'] | to_json }} {{ ansible_facts['getent_group']['openbao'] | to_json }}"
+        success_msg: user openbao (home /opt/openbao, shell /bin/false) with primary group openbao
+
+    - name: Stat the role-managed paths
+      ansible.builtin.stat:
+        path: "{{ item['path'] }}"
+      loop: "{{ __verify_paths }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+      register: __verify_path_stats
+
+    - name: Assert owner, group and mode of the role-managed paths
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['pw_name'] == item['item']['owner']
+          - item['stat']['gr_name'] == item['item']['group']
+          - item['stat']['mode'] == item['item']['mode']
+        fail_msg: >-
+          {{ item['item']['path'] }}: expected {{ item['item']['owner'] }}:{{ item['item']['group'] }}
+          {{ item['item']['mode'] }}, got {{ item['stat']['pw_name'] | default('-') }}:{{ item['stat']['gr_name'] | default('-') }}
+          {{ item['stat']['mode'] | default('missing') }}
+        success_msg: "{{ item['item']['path'] }} has the expected owner and mode"
+      loop: "{{ __verify_path_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item']['path'] }}"
+
+    - name: Stat the paths that must be absent
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ __verify_absent_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_absent_stats
+
+    - name: Assert the package binary, the restart marker and /root/.gnupg are absent
+      ansible.builtin.assert:
+        that:
+          - not item['stat']['exists']
+        fail_msg: "{{ item['item'] }} exists"
+        success_msg: "{{ item['item'] }} is absent"
+      loop: "{{ __verify_absent_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+    - name: Read the ExecStart of openbao.service
+      ansible.builtin.command: systemctl show openbao -p ExecStart --value  # noqa: command-instead-of-module
+      register: __verify_exec_start
+      changed_when: false
+
+    - name: Assert the unit runs the release binary
+      ansible.builtin.assert:
+        that:
+          - "'argv[]=/usr/local/bin/bao server -config=/etc/openbao/openbao.hcl' in __verify_exec_start['stdout']"
+        fail_msg: "{{ __verify_exec_start['stdout'] }}"
+        success_msg: openbao.service runs /usr/local/bin/bao
+
+    # The signature checks run gpg with --no-autostart in a throwaway home.
+    - name: Look for a leftover gpg-agent
+      ansible.builtin.command: pgrep -a gpg-agent
+      register: __verify_gpg_agent
+      changed_when: false
+      failed_when: false
+
+    - name: Find leftover scratch directories of the role
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "ansible.*.openbao-*"
+        file_type: directory
+      register: __verify_scratch
+
+    - name: Assert no gpg-agent and no scratch directory is left behind
+      ansible.builtin.assert:
+        that:
+          - __verify_gpg_agent['rc'] == 1
+          - __verify_scratch['matched'] == 0
+        fail_msg: "{{ __verify_gpg_agent['stdout_lines'] | to_json }} {{ __verify_scratch['files'] | map(attribute='path') | list | to_json }}"
+        success_msg: no gpg-agent process and no scratch directory left behind
+
+    - name: Read the seal status over TLS
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal
+      until: __verify_seal is succeeded
+      retries: 12
+      delay: 5
+
+    # Spec section 15 item 4: the seal-status type of seal "static" is the
+    # string static.
+    - name: Assert an initialized node auto-unsealed by the static seal
+      ansible.builtin.assert:
+        that:
+          - __verify_seal['json']['storage_type'] == 'raft'
+          - __verify_seal['json']['version'] == '2.7.3'
+          - __verify_seal['json']['initialized']
+          - not __verify_seal['json']['sealed']
+          - __verify_seal['json']['type'] == 'static'
+          - __verify_seal['json']['recovery_seal']
+        fail_msg: "{{ __verify_seal['json'] | to_json }}"
+        success_msg: node is initialized and unsealed by the static seal, with recovery keys
+
+    - name: Stat the controller init file
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+      register: __verify_init_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Read the controller init file
+      ansible.builtin.slurp:
+        src: "{{ __verify_init_file }}"
+      register: __verify_init_raw
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Parse the init output
+      ansible.builtin.set_fact:
+        __verify_init: "{{ __verify_init_raw['content'] | b64decode | from_json }}"
+      no_log: true
+
+    - name: Assert one recovery key and no unseal keys in the init output
+      ansible.builtin.assert:
+        that:
+          - __verify_init_stat['stat']['mode'] == '0600'
+          - __verify_init['root_token'] | default('') | length > 0
+          - __verify_init['recovery_keys_b64'] | default([], true) | length == 1
+          - __verify_init['unseal_keys_hex'] | default([], true) | length == 0
+        fail_msg: "mode {{ __verify_init_stat['stat']['mode'] }}, init output keys: {{ __verify_init | list | to_json }}"
+        success_msg: the init file (0600) holds a root token, one recovery key and no unseal keys
+
+    - name: Read openbao.hcl for the secret check
+      ansible.builtin.slurp:
+        src: /etc/openbao/openbao.hcl
+      register: __verify_hcl_raw
+
+    - name: Read the openbao journal
+      ansible.builtin.command: journalctl -u openbao --no-pager
+      register: __verify_journal
+      changed_when: false
+
+    - name: Assert neither the static seal key nor the recovery key appear in openbao.hcl or the journal
+      ansible.builtin.assert:
+        that:
+          - __verify_static_key not in __verify_hcl_text
+          - __verify_init['recovery_keys_b64'][0] not in __verify_hcl_text
+          - __verify_init['recovery_keys_hex'][0] not in __verify_hcl_text
+          - __verify_static_key not in __verify_journal['stdout']
+          - __verify_init['recovery_keys_b64'][0] not in __verify_journal['stdout']
+          - __verify_init['recovery_keys_hex'][0] not in __verify_journal['stdout']
+          - __verify_init['root_token'] not in __verify_journal['stdout']
+          - "'env://OPENBAO_SEAL_STATIC_CURRENT_KEY' in __verify_hcl_text"
+        fail_msg: a seal key, recovery key or the root token appears in openbao.hcl or in journalctl -u openbao
+        success_msg: openbao.hcl references the key through env:// and no secret appears in it or the journal
+      vars:
+        __verify_hcl_text: "{{ __verify_hcl_raw['content'] | b64decode }}"
+
+# A config change is a restart through the marker; the static seal unseals
+# the node by itself (the init output holds no unseal keys, so the role has
+# nothing to post).
+- name: Converge config change
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read the InvocationID before the config change
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_before
+      changed_when: false
+
+    # The cursor marks the end of the journal; the starts after it are counted.
+    - name: Read the journal cursor before the config change
+      ansible.builtin.command: journalctl -u openbao -n 1 --show-cursor --no-pager -o cat
+      register: __verify_journal_cursor
+      changed_when: false
+
+    - name: Include the role with openbao_log_level debug
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_log_level: debug
+        openbao_install_method: binary
+        openbao_binary_checksum: "{{ {'amd64': '131df9a21cf3dd2dff47107110b369c9974cbdaa482bcbc723b81b3403c68ecd', 'arm64': 'b505b07af4206fdf0e81b747fcb7e9e63f2c2b05e26ead973cce62d0ed07d0e0'}[openbao_arch] }}"
+        openbao_seal_type: static
+        openbao_seal_static_current_key_id: molecule-1
+        openbao_seal_static_current_key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') ~ '/static-seal.key') }}"
+        openbao_init_recovery_shares: 1
+        openbao_init_recovery_threshold: 1
+        openbao_init_encrypt_output: false
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-autounseal
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_peers:
+          - openbao-autounseal
+        openbao_tls_install_ca_to_trust_store: false
+
+    - name: Read the InvocationID after the config change
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_after
+      changed_when: false
+
+    - name: Read the journal since the cursor
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - openbao
+          - --no-pager
+          - -o
+          - cat
+          - "--after-cursor={{ __verify_journal_cursor['stdout_lines'] | last | regex_replace('^-- cursor: ', '') }}"
+      register: __verify_journal_change
+      changed_when: false
+
+    - name: Assert the node was restarted exactly once
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_after['stdout'] != __verify_invocation_before['stdout']
+          - __verify_starts | length == 1
+        fail_msg: >-
+          InvocationID {{ __verify_invocation_before['stdout'] }} ->
+          {{ __verify_invocation_after['stdout'] }}, server starts since the
+          config change: {{ __verify_starts | length }}
+        success_msg: the config change restarted the node exactly once
+      vars:
+        __verify_starts: "{{ __verify_journal_change['stdout_lines'] | select('search', 'OpenBao server started') | list }}"
+
+    - name: Read the seal status after the restart
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_after
+
+    - name: Stat the restart marker after the restart
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_after
+
+    - name: Read openbao.hcl after the config change
+      ansible.builtin.slurp:
+        src: /etc/openbao/openbao.hcl
+      register: __verify_hcl_change
+
+    - name: Assert the node is unsealed with the new config and no restart is pending
+      ansible.builtin.assert:
+        that:
+          - __verify_seal_after['json']['initialized']
+          - not __verify_seal_after['json']['sealed']
+          - not __verify_marker_after['stat']['exists']
+          - (__verify_hcl_change['content'] | b64decode) is search('log_level\\s*=\\s*"debug"')
+        fail_msg: "{{ __verify_seal_after['json'] | to_json }}, marker present: {{ __verify_marker_after['stat']['exists'] }}"
+        success_msg: the node auto-unsealed after the restart, log_level is debug, no marker left
+
+# Converge plays 2 and 3: the plugin of the AWS KMS seal, with the GPG check
+# of the archive (default directory) and with the pinned checksum only
+# (/opt/openbao/plugins-pinned). Neither play renders config.
+- name: Verify KMS plugins
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_plugin_sha256: "{{ {'x86_64': '0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76', 'aarch64': '986487f17d30123b4730cf412ad2267f7ef4cfe637c75252ed6d13294673bae2'}[ansible_facts['architecture']] }}"
+    __verify_plugin_dirs:
+      - /opt/openbao/plugins
+      - /opt/openbao/plugins-pinned
+  tasks:
+    - name: Stat the plugin directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ __verify_plugin_dirs }}"
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_plugin_dir_stats
+
+    - name: Stat the plugin files with their SHA-256
+      ansible.builtin.stat:
+        path: "{{ item }}/openbao-plugin-kms-aws_0.1.1"
+        checksum_algorithm: sha256
+      loop: "{{ __verify_plugin_dirs }}"
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_plugin_stats
+
+    - name: Assert the plugin directories are owned by the service user with mode 0750
+      ansible.builtin.assert:
+        that:
+          - item['stat']['isdir'] | default(false)
+          - item['stat']['pw_name'] == 'openbao'
+          - item['stat']['gr_name'] == 'openbao'
+          - item['stat']['mode'] == '0750'
+        fail_msg: "{{ item['item'] }}: {{ item['stat'] | to_json }}"
+        success_msg: "{{ item['item'] }} is openbao:openbao 0750"
+      loop: "{{ __verify_plugin_dir_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+    - name: Assert the plugin files are the pinned release binary
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['pw_name'] == 'openbao'
+          - item['stat']['gr_name'] == 'openbao'
+          - item['stat']['mode'] == '0750'
+          - item['stat']['checksum'] == __verify_plugin_sha256
+        fail_msg: "{{ item['item'] }}/openbao-plugin-kms-aws_0.1.1: {{ item['stat'] | to_json }}"
+        success_msg: "{{ item['item'] }}/openbao-plugin-kms-aws_0.1.1 is openbao:openbao 0750 with the pinned SHA-256"
+      loop: "{{ __verify_plugin_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+    - name: Read openbao.hcl after the plugin plays
+      ansible.builtin.slurp:
+        src: /etc/openbao/openbao.hcl
+      register: __verify_hcl_plugins
+
+    - name: Assert the plugin plays rendered no config
+      ansible.builtin.assert:
+        that:
+          - "'plugin_directory' not in __verify_hcl_text"
+          - "'plugin \"kms\"' not in __verify_hcl_text"
+          - "'seal \"static\"' in __verify_hcl_text"
+        fail_msg: openbao.hcl carries a plugin stanza or lost its static seal
+        success_msg: openbao.hcl still has the static seal and no plugin stanza
+      vars:
+        __verify_hcl_text: "{{ __verify_hcl_plugins['content'] | b64decode }}"
+
+# Test fixture for the negative plays: a local mirror served through file://
+# URLs. good/ holds the signed checksums.txt of 2.7.3 with a tarball that is
+# not the release, and the real KMS plugin archive with its signature.
+# bad-sig/ holds a tampered checksums.txt and a tampered plugin archive next
+# to the original signatures.
+- name: Prepare a tampered release mirror
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+    __verify_plugin_archive: "openbao-plugin-kms-aws_linux_{{ __verify_arch }}_{{ {'amd64': 'v1', 'arm64': 'v8'}[__verify_arch] }}.tar.gz"
+  tasks:
+    - name: Create the mirror directories
+      ansible.builtin.file:
+        path: "/srv/openbao-mirror/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - good/v2.7.3
+        - good/kms-aws-v0.1.1
+        - bad-sig/v2.7.3
+        - bad-sig/kms-aws-v0.1.1
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Download the signed release files
+      ansible.builtin.get_url:
+        url: "https://github.com/openbao/{{ item }}"
+        dest: "/srv/openbao-mirror/good/{{ item | regex_replace('^[^/]+/releases/download/', '') }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - openbao/releases/download/v2.7.3/checksums.txt
+        - openbao/releases/download/v2.7.3/checksums.txt.gpgsig
+        - "openbao-plugins/releases/download/kms-aws-v0.1.1/{{ __verify_plugin_archive }}"
+        - "openbao-plugins/releases/download/kms-aws-v0.1.1/{{ __verify_plugin_archive }}.sig"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    - name: Write a tarball that is not the release
+      ansible.builtin.copy:
+        content: "not the OpenBao release\n"
+        dest: "/srv/openbao-mirror/{{ item }}/v2.7.3/openbao_2.7.3_linux_{{ __verify_arch }}.tar.gz"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - good
+        - bad-sig
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Write the tampered copies next to the original signatures
+      ansible.builtin.shell: >-
+        set -e;
+        cp good/v2.7.3/checksums.txt.gpgsig bad-sig/v2.7.3/;
+        cat good/v2.7.3/checksums.txt > bad-sig/v2.7.3/checksums.txt;
+        echo '0000000000000000000000000000000000000000000000000000000000000000  extra' >> bad-sig/v2.7.3/checksums.txt;
+        cp good/kms-aws-v0.1.1/{{ __verify_plugin_archive }}.sig bad-sig/kms-aws-v0.1.1/;
+        cat good/kms-aws-v0.1.1/{{ __verify_plugin_archive }} > bad-sig/kms-aws-v0.1.1/{{ __verify_plugin_archive }};
+        printf 'x' >> bad-sig/kms-aws-v0.1.1/{{ __verify_plugin_archive }}
+      args:
+        chdir: /srv/openbao-mirror
+      changed_when: true
+
+    - name: Read the InvocationID before the negative plays
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_negative
+      changed_when: false
+
+    - name: Record the binary checksum before the negative plays
+      ansible.builtin.stat:
+        path: /usr/local/bin/bao
+        checksum_algorithm: sha1
+      register: __verify_bin_negative
+
+- name: Negative - release checksum mismatch
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    # A binary path with nothing installed makes the role download again;
+    # the signed checksums.txt does not list the fake tarball's hash.
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the install stage with a tarball that is not the release
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install.yml
+          vars:
+            openbao_install_method: binary
+            openbao_bin_path: /usr/local/sbin/bao
+            openbao_binary_base_url: file:///srv/openbao-mirror/good
+            openbao_binary_checksum: ""
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Release checksum verification failed.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - release signature mismatch
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the install stage with a tampered checksums.txt
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install.yml
+          vars:
+            openbao_install_method: binary
+            openbao_bin_path: /usr/local/sbin/bao
+            openbao_binary_base_url: file:///srv/openbao-mirror/bad-sig
+            openbao_binary_checksum: ""
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Release signature does not match the pinned key.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - binary downgrade
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the install stage with openbao_version 2.7.2
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install.yml
+          vars:
+            openbao_install_method: binary
+            openbao_version: "2.7.2"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Downgrade refused.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - KMS plugin signature mismatch
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the KMS plugin install with a tampered archive
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install_plugin.yml
+          vars:
+            openbao_seal_type: awskms
+            openbao_seal_plugin_base_url: file:///srv/openbao-mirror/bad-sig
+            openbao_plugin_dir: /opt/openbao/plugins-negative
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Release signature does not match the pinned key.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Negative - KMS plugin checksum mismatch
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the KMS plugin install with a wrong pinned checksum
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install_plugin.yml
+          vars:
+            openbao_seal_type: awskms
+            openbao_seal_plugin_base_url: file:///srv/openbao-mirror/good
+            openbao_seal_plugin_checksum: "{{ '0' * 64 }}"
+            openbao_binary_verify_gpg: false
+            openbao_plugin_dir: /opt/openbao/plugins-negative
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'KMS plugin checksum mismatch.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+# tasks_from: install_plugin.yml skips validate.yml, so the task file refuses
+# an unverified download itself (anti-goal 7).
+- name: Negative - unverified KMS plugin download
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the KMS plugin install with neither GPG nor a checksum
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install_plugin.yml
+          vars:
+            openbao_seal_type: awskms
+            openbao_seal_plugin_base_url: file:///srv/openbao-mirror/good
+            openbao_binary_verify_gpg: false
+            openbao_plugin_dir: /opt/openbao/plugins-unverified
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Unverified KMS plugin download refused.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+- name: Verify the failed runs left nothing behind
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stat the paths the failed runs must not create
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /usr/local/sbin/bao
+        - /opt/openbao/plugins-negative/openbao-plugin-kms-aws_0.1.1
+        - /opt/openbao/plugins-unverified
+        - /etc/openbao/.ansible-restart-pending
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_negative_stats
+
+    - name: Assert the failed runs installed nothing and left no restart marker
+      ansible.builtin.assert:
+        that:
+          - not item['stat']['exists']
+        fail_msg: "{{ item['item'] }} exists"
+        success_msg: "{{ item['item'] }} is absent"
+      loop: "{{ __verify_negative_stats['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+    - name: Find leftover scratch directories of the role
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "ansible.*.openbao-*"
+        file_type: directory
+      register: __verify_negative_scratch
+
+    - name: Read the InvocationID after the negative plays
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_negative_after
+      changed_when: false
+
+    - name: Record the binary checksum after the negative plays
+      ansible.builtin.stat:
+        path: /usr/local/bin/bao
+        checksum_algorithm: sha1
+      register: __verify_bin_negative_after
+
+    - name: Assert the scratch directories are gone and the node is untouched
+      ansible.builtin.assert:
+        that:
+          - __verify_negative_scratch['matched'] == 0
+          - __verify_invocation_negative_after['stdout'] == __verify_invocation_negative['stdout']
+          - __verify_bin_negative_after['stat']['checksum'] == __verify_bin_negative['stat']['checksum']
+        fail_msg: >-
+          scratch dirs {{ __verify_negative_scratch['files'] | map(attribute='path') | list | to_json }},
+          InvocationID {{ __verify_invocation_negative['stdout'] }} ->
+          {{ __verify_invocation_negative_after['stdout'] }}
+        success_msg: no scratch directory left, service not restarted, binary unchanged
+
+# The installed signing key is checked on every run; a wrong pin fails before
+# anything is downloaded or replaced.
+- name: Negative - signing key fingerprint mismatch
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the signing key and binary checksums before the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /usr/local/share/openbao/openbao-signing-key.asc
+        - /usr/local/bin/bao
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_key_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the install stage with a wrong signing key fingerprint
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+            tasks_from: install.yml
+          vars:
+            openbao_install_method: binary
+            openbao_gpg_key_fingerprint: "0000000000000000000000000000000000000000"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'OpenBao signing key fingerprint mismatch.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the signing key and binary checksums after the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /usr/local/share/openbao/openbao-signing-key.asc
+        - /usr/local/bin/bao
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_key_after
+
+    - name: Assert the signing key and the binary are unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_key_after['results'] | map(attribute='stat.checksum') | list == __verify_key_before['results'] | map(attribute='stat.checksum') | list
+        fail_msg: >-
+          {{ __verify_key_before['results'] | map(attribute='stat.checksum') | list | to_json }} ->
+          {{ __verify_key_after['results'] | map(attribute='stat.checksum') | list | to_json }}
+        success_msg: the signing key file and /usr/local/bin/bao are byte-identical

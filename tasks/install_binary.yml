@@ -1,0 +1,248 @@
+---
+# ==============================================================================
+# Install OpenBao from the GitHub release tarball (spec section 5.3).
+# Included by install.yml when openbao_install_method is 'binary'. The
+# tarball is trusted through checksums.txt signed by the pinned key
+# (openbao_binary_verify_gpg) and/or the pinned openbao_binary_checksum;
+# validate.yml rule 24 requires at least one. The download runs only when the
+# installed binary reports another version.
+# Produces __openbao_bin_result, the result of the binary copy, for the
+# restart marker in install.yml.
+# ==============================================================================
+
+- name: Read the version of the installed bao binary
+  ansible.builtin.command:
+    argv:
+      - "{{ openbao_bin_path }}"
+      - version
+  register: __openbao_bin_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: install
+
+# Empty when the binary is missing or prints no version.
+- name: Record the installed binary version
+  ansible.builtin.set_fact:
+    __openbao_bin_installed_version: >-
+      {{ __openbao_bin_version['stdout'] | default('')
+         | regex_search('OpenBao v([0-9][0-9.]*)', '\1') | default([''], true) | first }}
+  tags: install
+
+# OpenBao does not support downgrades: the data written by a newer version is
+# not guaranteed to be readable by an older one.
+- name: Refuse a downgrade of the bao binary
+  ansible.builtin.assert:
+    that:
+      - __openbao_bin_installed_version | length == 0 or __openbao_bin_installed_version is version(openbao_version, '<=')
+    fail_msg: >-
+      Downgrade refused.
+      {{ openbao_bin_path }} on {{ inventory_hostname }} is OpenBao
+      {{ __openbao_bin_installed_version }} and openbao_version is
+      {{ openbao_version }}. OpenBao does not support downgrades. Set
+      openbao_version to {{ __openbao_bin_installed_version }} or later, or
+      restore a raft snapshot taken with the older version on a fresh install
+      instead.
+    quiet: true
+  tags: install
+
+# What the package preinst does for the package method.
+- name: Create the OpenBao system group
+  ansible.builtin.group:
+    name: "{{ openbao_group }}"
+    system: true
+    state: present
+  tags: install
+
+- name: Create the OpenBao system user
+  ansible.builtin.user:
+    name: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    system: true
+    shell: /bin/false
+    create_home: false
+    home: /opt/openbao
+    state: present
+  tags: install
+
+# install.yml writes the restart marker into the config directory, which the
+# package creates for the package method (config.yml re-asserts it later).
+- name: Create the OpenBao config directory
+  ansible.builtin.file:
+    path: "{{ openbao_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ openbao_group }}"
+    mode: "0750"
+  tags: install
+
+- name: Download, verify and install the bao binary
+  when:
+    - __openbao_bin_installed_version != openbao_version
+    - not ansible_check_mode
+  vars:
+    __openbao_tarball: "openbao_{{ openbao_version }}_linux_{{ openbao_arch }}.tar.gz"
+    __openbao_release_url: "{{ openbao_binary_base_url }}/v{{ openbao_version }}"
+  tags: install
+  block:
+    - name: Create a scratch directory for the download
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .openbao-bin
+      register: __openbao_bin_tmp
+      tags: install
+
+    - name: Download the release tarball
+      ansible.builtin.get_url:
+        url: "{{ __openbao_release_url }}/{{ __openbao_tarball }}"
+        dest: "{{ __openbao_bin_tmp['path'] }}/{{ __openbao_tarball }}"
+        checksum: "{{ ('sha256:' ~ openbao_binary_checksum) if openbao_binary_checksum | length > 0 else omit }}"
+        mode: "0600"
+      tags: install
+
+    - name: Download checksums.txt and its signature
+      ansible.builtin.get_url:
+        url: "{{ __openbao_release_url }}/{{ item }}"
+        dest: "{{ __openbao_bin_tmp['path'] }}/{{ item }}"
+        mode: "0600"
+      loop:
+        - checksums.txt
+        - checksums.txt.gpgsig
+      loop_control:
+        label: "{{ item }}"
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    # A throwaway GnuPG home in the scratch directory, so no /root/.gnupg is
+    # created. --no-autostart: importing a public key needs no gpg-agent, and
+    # an agent started here would outlive the scratch directory.
+    - name: Import the signing key into a throwaway keyring
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --homedir
+          - "{{ __openbao_bin_tmp['path'] }}"
+          - --batch
+          - --no-autostart
+          - --import
+          - "{{ __openbao_gpg_key_path }}"
+      changed_when: false
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Verify the signature of checksums.txt
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --homedir
+          - "{{ __openbao_bin_tmp['path'] }}"
+          - --batch
+          - --no-autostart
+          - --status-fd
+          - "1"
+          - --verify
+          - "{{ __openbao_bin_tmp['path'] }}/checksums.txt.gpgsig"
+          - "{{ __openbao_bin_tmp['path'] }}/checksums.txt"
+      register: __openbao_bin_gpg
+      changed_when: false
+      failed_when: false
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    # A good signature alone only proves that some key in the keyring signed
+    # the file. The last field of a VALIDSIG status line is the primary key
+    # fingerprint of the signer; it must be the pin.
+    - name: Assert checksums.txt is signed by the pinned key
+      ansible.builtin.assert:
+        that:
+          - __openbao_bin_gpg['rc'] == 0
+          - __openbao_gpg_expected in __openbao_gpg_signers
+        fail_msg: >-
+          Release signature does not match the pinned key.
+          gpg --verify of checksums.txt for OpenBao {{ openbao_version }}
+          ({{ __openbao_release_url }}) exited {{ __openbao_bin_gpg['rc'] }}
+          with signer primary fingerprints
+          '{{ __openbao_gpg_signers | join(', ') }}'; expected
+          {{ __openbao_gpg_expected }} (openbao_gpg_key_fingerprint). Status:
+          {{ __openbao_bin_gpg['stdout_lines'] | select('match', '.GNUPG:. (BADSIG|ERRSIG|NO_PUBKEY|EXPKEYSIG|REVKEYSIG) ') | join('; ') }}.
+          The download is refused; check openbao_binary_base_url (mirror) and
+          the release files.
+        quiet: true
+      vars:
+        __openbao_gpg_expected: "{{ openbao_gpg_key_fingerprint | upper | replace(' ', '') }}"
+        __openbao_gpg_signers: >-
+          {{ __openbao_bin_gpg['stdout_lines'] | select('match', '.GNUPG:. VALIDSIG ')
+             | map('split') | map('last') | map('upper') | list }}
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Stat the downloaded tarball
+      ansible.builtin.stat:
+        path: "{{ __openbao_bin_tmp['path'] }}/{{ __openbao_tarball }}"
+        get_checksum: false
+      register: __openbao_bin_tarball
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    # checksums.txt lists every asset of the release but only this tarball is
+    # present: --ignore-missing skips the others, and the assert below
+    # requires the 'OK' line of this tarball, because --ignore-missing alone
+    # would pass without checking anything.
+    - name: Check the tarball against checksums.txt
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - --ignore-missing
+          - -c
+          - checksums.txt
+        chdir: "{{ __openbao_bin_tmp['path'] }}"
+      register: __openbao_bin_sha
+      changed_when: false
+      failed_when: false
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Assert the tarball matches checksums.txt
+      ansible.builtin.assert:
+        that:
+          - __openbao_bin_tarball['stat']['exists']
+          - "(__openbao_tarball ~ ': OK') in __openbao_bin_sha['stdout_lines']"
+        fail_msg: >-
+          Release checksum verification failed.
+          {{ __openbao_tarball }} {{ 'was checked against' if __openbao_bin_tarball['stat']['exists'] else 'is missing, so it could not be checked against' }}
+          the signed checksums.txt of OpenBao {{ openbao_version }}
+          ({{ __openbao_release_url }}): {{ __openbao_bin_sha['stdout_lines'] | join('; ') | default('no output', true) }}.
+          The download is refused; check openbao_binary_base_url (mirror) and
+          the release files.
+        quiet: true
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Extract the bao binary
+      ansible.builtin.unarchive:
+        src: "{{ __openbao_bin_tmp['path'] }}/{{ __openbao_tarball }}"
+        dest: "{{ __openbao_bin_tmp['path'] }}"
+        remote_src: true
+        include:
+          - bao
+      tags: install
+
+    # copy replaces the file atomically (rename), so a running process keeps
+    # its binary until the restart.
+    - name: Install the bao binary
+      ansible.builtin.copy:
+        src: "{{ __openbao_bin_tmp['path'] }}/bao"
+        dest: "{{ openbao_bin_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: __openbao_bin_result
+      tags: install
+  always:
+    - name: Remove the download scratch directory
+      ansible.builtin.file:
+        path: "{{ __openbao_bin_tmp['path'] }}"
+        state: absent
+      when: __openbao_bin_tmp['path'] is defined
+      tags: install

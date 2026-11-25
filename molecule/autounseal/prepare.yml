@@ -1,0 +1,44 @@
+---
+# Prepare the autounseal container before the role runs: bootstrap Python and
+# gather facts. The role installs OpenBao itself from the release tarball.
+# Also creates the static seal key on the controller in the Molecule
+# ephemeral directory (spec section 12.1), which Molecule prunes after every
+# full sequence. force: false keeps the key stable across converge,
+# idempotence and verify.
+
+- name: Prepare autounseal container
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Detect available package manager
+      ansible.builtin.raw: command -v apt-get >/dev/null 2>&1 && echo apt || echo dnf
+      register: __verify_pkg_mgr
+      changed_when: false
+
+    - name: Bootstrap Python (Debian/Ubuntu)
+      ansible.builtin.raw: >-
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends python3 python3-apt
+      changed_when: true
+      when: "'apt' in __verify_pkg_mgr['stdout']"
+
+    - name: Bootstrap Python (RHEL/Rocky)
+      ansible.builtin.raw: >-
+        dnf install -y python3
+      changed_when: true
+      when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+    - name: Gather facts after bootstrap
+      ansible.builtin.setup:
+
+    # 64 hex characters are the 32 bytes the static seal needs.
+    - name: Create the controller-side static seal key
+      ansible.builtin.copy:
+        content: "{{ lookup('ansible.builtin.password', '/dev/null', length=64, chars=['0123456789abcdef']) }}"
+        dest: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/static-seal.key"
+        force: false
+        mode: "0600"
+      run_once: true
+      delegate_to: localhost
+      become: false
+      no_log: true

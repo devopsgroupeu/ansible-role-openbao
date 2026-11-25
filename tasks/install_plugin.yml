@@ -1,0 +1,193 @@
+---
+# ==============================================================================
+# Install the external KMS plugin of a cloud seal (spec section 5.3).
+# Included by install.yml when openbao_seal_type is a cloud seal. Also usable
+# on its own through tasks_from: install_plugin.yml: it needs only role
+# defaults, vars and the signing key installed by a full run.
+# The installed file name __openbao_seal_plugin_command (vars/main.yml)
+# carries the plugin version, so "the file exists" is the idempotency probe
+# and an upgrade is a new file plus a config change.
+# Produces __openbao_plugin_result, the result of the plugin copy, for the
+# restart marker in install.yml.
+# ==============================================================================
+
+# validate.yml rule 25, repeated because tasks_from: install_plugin.yml does
+# not run validate.yml (anti-goal 7: no download without a signature chain to
+# the pinned key or a pinned checksum).
+- name: Refuse an unverified KMS plugin download
+  ansible.builtin.assert:
+    that:
+      - (openbao_binary_verify_gpg | bool) or (openbao_seal_plugin_checksum | length > 0)
+    fail_msg: >-
+      Unverified KMS plugin download refused.
+      openbao_binary_verify_gpg is false and openbao_seal_plugin_checksum is
+      empty, so nothing would verify the plugin of openbao_seal_type
+      '{{ openbao_seal_type }}'. Keep openbao_binary_verify_gpg: true, or pin
+      openbao_seal_plugin_checksum (SHA-256 of the extracted plugin binary for
+      this architecture).
+    quiet: true
+  tags: install
+
+# Owned by the service user: OpenBao's file permission check requires the
+# plugin directory and binaries to be owned by the process uid.
+- name: Create the KMS plugin directory
+  ansible.builtin.file:
+    path: "{{ openbao_plugin_dir }}"
+    state: directory
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0750"
+  tags: install
+
+- name: Stat the installed KMS plugin
+  ansible.builtin.stat:
+    path: "{{ openbao_plugin_dir }}/{{ __openbao_seal_plugin_command }}"
+    get_checksum: false
+  register: __openbao_plugin_stat
+  tags: install
+
+# Release assets: kms-<slug>-v<version>/openbao-plugin-kms-<slug>_linux_<arch>_<micro>.tar.gz
+# with a detached signature <asset>.tar.gz.sig; the archive holds one binary
+# named <asset>.
+- name: Download, verify and install the KMS plugin
+  when:
+    - not __openbao_plugin_stat['stat']['exists']
+    - not ansible_check_mode
+  vars:
+    __openbao_plugin_asset: "openbao-plugin-kms-{{ __openbao_kms_plugins[openbao_seal_type] }}_linux_{{ openbao_arch }}_{{ __openbao_kms_microarch[openbao_arch] }}"
+    __openbao_plugin_url: "{{ openbao_seal_plugin_base_url }}/kms-{{ __openbao_kms_plugins[openbao_seal_type] }}-v{{ openbao_seal_plugin_version }}/{{ __openbao_plugin_asset }}.tar.gz"
+  tags: install
+  block:
+    - name: Create a scratch directory for the plugin download
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .openbao-plugin
+      register: __openbao_plugin_tmp
+      tags: install
+
+    - name: Download the KMS plugin archive
+      ansible.builtin.get_url:
+        url: "{{ __openbao_plugin_url }}"
+        dest: "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}.tar.gz"
+        mode: "0600"
+      tags: install
+
+    - name: Download the signature of the KMS plugin archive
+      ansible.builtin.get_url:
+        url: "{{ __openbao_plugin_url }}.sig"
+        dest: "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}.tar.gz.sig"
+        mode: "0600"
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    # Same throwaway keyring as install_binary.yml (no /root/.gnupg, no
+    # gpg-agent).
+    - name: Import the signing key into a throwaway keyring
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --homedir
+          - "{{ __openbao_plugin_tmp['path'] }}"
+          - --batch
+          - --no-autostart
+          - --import
+          - "{{ __openbao_gpg_key_path }}"
+      changed_when: false
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Verify the signature of the KMS plugin archive
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --homedir
+          - "{{ __openbao_plugin_tmp['path'] }}"
+          - --batch
+          - --no-autostart
+          - --status-fd
+          - "1"
+          - --verify
+          - "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}.tar.gz.sig"
+          - "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}.tar.gz"
+      register: __openbao_plugin_gpg
+      changed_when: false
+      failed_when: false
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    # The last field of a VALIDSIG status line is the primary key fingerprint
+    # of the signer; it must be the pin.
+    - name: Assert the KMS plugin archive is signed by the pinned key
+      ansible.builtin.assert:
+        that:
+          - __openbao_plugin_gpg['rc'] == 0
+          - __openbao_gpg_expected in __openbao_gpg_signers
+        fail_msg: >-
+          Release signature does not match the pinned key.
+          gpg --verify of {{ __openbao_plugin_asset }}.tar.gz
+          ({{ __openbao_plugin_url }}) exited {{ __openbao_plugin_gpg['rc'] }}
+          with signer primary fingerprints
+          '{{ __openbao_gpg_signers | join(', ') }}'; expected
+          {{ __openbao_gpg_expected }} (openbao_gpg_key_fingerprint). Status:
+          {{ __openbao_plugin_gpg['stdout_lines'] | select('match', '.GNUPG:. (BADSIG|ERRSIG|NO_PUBKEY|EXPKEYSIG|REVKEYSIG) ') | join('; ') }}.
+          The download is refused; check openbao_seal_plugin_base_url (mirror)
+          and the release files.
+        quiet: true
+      vars:
+        __openbao_gpg_expected: "{{ openbao_gpg_key_fingerprint | upper | replace(' ', '') }}"
+        __openbao_gpg_signers: >-
+          {{ __openbao_plugin_gpg['stdout_lines'] | select('match', '.GNUPG:. VALIDSIG ')
+             | map('split') | map('last') | map('upper') | list }}
+      when: openbao_binary_verify_gpg | bool
+      tags: install
+
+    - name: Extract the KMS plugin binary
+      ansible.builtin.unarchive:
+        src: "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}.tar.gz"
+        dest: "{{ __openbao_plugin_tmp['path'] }}"
+        remote_src: true
+        include:
+          - "{{ __openbao_plugin_asset }}"
+      tags: install
+
+    - name: Checksum the extracted KMS plugin binary
+      ansible.builtin.stat:
+        path: "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}"
+        checksum_algorithm: sha256
+      register: __openbao_plugin_sum
+      when: openbao_seal_plugin_checksum | length > 0
+      tags: install
+
+    - name: Assert the KMS plugin binary matches the pinned checksum
+      ansible.builtin.assert:
+        that:
+          - __openbao_plugin_sum['stat']['checksum'] | default('') == openbao_seal_plugin_checksum
+        fail_msg: >-
+          KMS plugin checksum mismatch.
+          {{ __openbao_plugin_asset }} from {{ __openbao_plugin_url }} has
+          SHA-256 '{{ __openbao_plugin_sum['stat']['checksum'] | default('') }}',
+          openbao_seal_plugin_checksum is '{{ openbao_seal_plugin_checksum }}'.
+          The plugin is not installed. Pin the SHA-256 of the extracted binary
+          for this architecture (checksums-kms-{{ __openbao_kms_plugins[openbao_seal_type] }}.txt
+          of the release), not the hash of the archive.
+        quiet: true
+      when: openbao_seal_plugin_checksum | length > 0
+      tags: install
+
+    - name: Install the KMS plugin under its versioned name
+      ansible.builtin.copy:
+        src: "{{ __openbao_plugin_tmp['path'] }}/{{ __openbao_plugin_asset }}"
+        dest: "{{ openbao_plugin_dir }}/{{ __openbao_seal_plugin_command }}"
+        remote_src: true
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0750"
+      register: __openbao_plugin_result
+      tags: install
+  always:
+    - name: Remove the plugin scratch directory
+      ansible.builtin.file:
+        path: "{{ __openbao_plugin_tmp['path'] }}"
+        state: absent
+      when: __openbao_plugin_tmp['path'] is defined
+      tags: install

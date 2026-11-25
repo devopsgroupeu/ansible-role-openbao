@@ -1,0 +1,66 @@
+---
+# Single node, binary install and auto-unseal (spec section 12.2, List C):
+# the GitHub release tarball verified through the signed checksums.txt and the
+# pinned per-arch checksum, generated TLS, seal "static" with a throwaway key
+# from prepare.yml, one recovery share. Two more converge plays install the
+# AWS KMS plugin through tasks_from: install_plugin.yml, with GPG and with the
+# pinned checksum only. verify.yml then checks a config change restart that
+# auto-unseals, the plugin files, the download verification failures and the
+# signing key pin.
+# Run with: molecule test -s autounseal (MOLECULE_DISTRO=ubuntu2404 for the
+# other image of the CI matrix).
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: openbao-autounseal
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - openbao
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - verify
+    - cleanup
+    - destroy

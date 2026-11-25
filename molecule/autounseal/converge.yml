@@ -1,0 +1,105 @@
+---
+# Converge for the autounseal scenario. Play 1 runs the whole role: binary
+# install, generated TLS, seal "static", init with recovery shares. Plays 2
+# and 3 install the AWS KMS plugin only (tasks_from: install_plugin.yml); they
+# never render config, so the node keeps its static seal. The verify plays
+# re-include the role with the vars of play 1.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Install the GitHub release tarball instead of the package.
+    openbao_install_method: binary
+
+    # Pinned SHA-256 of the 2.7.3 tarball, per architecture, checked together
+    # with the signed checksums.txt (openbao_binary_verify_gpg stays true).
+    openbao_binary_checksum: "{{ {'amd64': '131df9a21cf3dd2dff47107110b369c9974cbdaa482bcbc723b81b3403c68ecd', 'arm64': 'b505b07af4206fdf0e81b747fcb7e9e63f2c2b05e26ead973cce62d0ed07d0e0'}[openbao_arch] }}"
+
+    # Built-in auto-unseal that needs no external service.
+    openbao_seal_type: static
+
+    # Permanent id of the throwaway seal key.
+    openbao_seal_static_current_key_id: molecule-1
+
+    # Throwaway 32-byte hex key created by prepare.yml.
+    openbao_seal_static_current_key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') ~ '/static-seal.key') }}"
+
+    # One recovery share is enough for a single-node test cluster.
+    openbao_init_recovery_shares: 1
+
+    # Threshold must not exceed the share count.
+    openbao_init_recovery_threshold: 1
+
+    # Plain init output: the recovery key is checked by verify.yml.
+    openbao_init_encrypt_output: false
+
+    # Keep the init output in the ephemeral directory Molecule prunes.
+    openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+
+    # Fixed cluster id instead of the inventory-derived default.
+    openbao_cluster_id: molecule-autounseal
+
+    # No pre-placed certificates in the container: generate a CA and node cert.
+    openbao_tls_generate_certs: true
+
+    # Loopback API address: the generated certificate covers 127.0.0.1.
+    openbao_api_addr: "https://127.0.0.1:8200"
+
+    # Loopback cluster address for the single-node container.
+    openbao_cluster_addr: "https://127.0.0.1:8201"
+
+    # Single-node cluster.
+    openbao_raft_peers:
+      - openbao-autounseal
+
+    # Do not touch the OS trust store of the ephemeral container.
+    openbao_tls_install_ca_to_trust_store: false
+
+  tasks:
+    - name: Include openbao role
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+
+- name: Converge KMS plugin
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Install the plugin of the AWS KMS seal (the node keeps its static seal).
+    openbao_seal_type: awskms
+
+    # Pinned SHA-256 of the extracted kms-aws 0.1.1 binary, per architecture,
+    # checked together with the GPG signature of the archive.
+    openbao_seal_plugin_checksum: "{{ {'amd64': '0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76', 'arm64': '986487f17d30123b4730cf412ad2267f7ef4cfe637c75252ed6d13294673bae2'}[openbao_arch] }}"
+
+  tasks:
+    - name: Include the KMS plugin install of the role
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+        tasks_from: install_plugin.yml
+
+- name: Converge KMS plugin, checksum only
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # Install the plugin of the AWS KMS seal (the node keeps its static seal).
+    openbao_seal_type: awskms
+
+    # Pinned SHA-256 of the extracted kms-aws 0.1.1 binary, per architecture:
+    # the only verification in this play.
+    openbao_seal_plugin_checksum: "{{ {'amd64': '0dffe0a159a5bdbeb147a892595fe517de858f48a99a64f33fabc775af0eec76', 'arm64': '986487f17d30123b4730cf412ad2267f7ef4cfe637c75252ed6d13294673bae2'}[openbao_arch] }}"
+
+    # Skip the GPG check of the archive (mirrors without signatures).
+    openbao_binary_verify_gpg: false
+
+    # Second directory, so this play downloads and installs again.
+    openbao_plugin_dir: /opt/openbao/plugins-pinned
+
+  tasks:
+    - name: Include the KMS plugin install of the role
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+        tasks_from: install_plugin.yml

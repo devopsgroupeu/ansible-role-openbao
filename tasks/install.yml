@@ -1,7 +1,8 @@
 ---
 # ==============================================================================
 # Install (spec section 5.3): dependencies, the verified signing key, the
-# install method, the restart marker after a software change.
+# install method (package or release tarball), the KMS plugin of a cloud
+# seal, the restart marker after a software change.
 # Included by main.yml unless openbao_config_only.
 # ==============================================================================
 
@@ -157,9 +158,23 @@
   when: openbao_install_method == 'package'
   tags: install
 
+- name: Install OpenBao from the release tarball
+  ansible.builtin.include_tasks: install_binary.yml
+  when: openbao_install_method == 'binary'
+  tags: install
+
+# OpenBao 2.7 has no built-in cloud KMS seals; they run as external plugins.
+- name: Install the KMS plugin of the cloud seal
+  ansible.builtin.include_tasks: install_plugin.yml
+  when: openbao_seal_type in __openbao_kms_plugins
+  tags: install
+
 # Restart intent is a persistent marker (spec section 5.8), written right
-# after the software changed: the running process keeps the old binary until
-# the rolling restart (or the first start in service.yml) replaces it.
+# after the software changed: the running process keeps the old binary and
+# plugin until the rolling restart (or the first start in service.yml)
+# replaces them. Each result counts only when its task file ran in this
+# include, so a result registered by an earlier include in the same run
+# (another method or seal) cannot write a marker.
 - name: Record a pending restart after a software change
   ansible.builtin.copy:
     content: "restart pending\n"
@@ -168,6 +183,9 @@
     group: root
     mode: "0600"
   when:
-    - openbao_install_method == 'package' and __openbao_pkg_result is changed
+    - >-
+      (openbao_install_method == 'package' and __openbao_pkg_result is changed)
+      or (openbao_install_method == 'binary' and __openbao_bin_result is changed)
+      or (openbao_seal_type in __openbao_kms_plugins and __openbao_plugin_result is changed)
     - not ansible_check_mode
   tags: install
