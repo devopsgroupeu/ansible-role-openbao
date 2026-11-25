@@ -6,7 +6,8 @@
 # marker exists (config, unit, package or binary change) or when the version
 # it runs differs from openbao_version. The flagged nodes restart one at a
 # time from a run_once loop: the standbys in inventory order, the leader last.
-# restart_node.yml checks quorum before and health after each node.
+# restart_node.yml checks quorum before and health after each node. A Shamir
+# cluster whose unseal keys are missing is refused before any restart.
 # Check mode: lists the nodes that would be restarted, restarts nothing.
 # Produces:
 #   __openbao_restart_required  this node needs a restart
@@ -56,6 +57,30 @@
       {%- endfor -%}
       {{ ns.standbys + ns.leaders }}
   run_once: true
+  tags: restart
+
+# A restarted Shamir node comes back sealed. Without the unseal keys (no init
+# file on this controller) the role could not unseal it, so it refuses before
+# any node goes down; the restarts stay pending. With openbao_unseal: false
+# the operator unseals by hand while the health gate waits.
+- name: Assert unseal keys are available for the restart
+  ansible.builtin.assert:
+    that:
+      - not (openbao_seal_type == 'shamir' and openbao_unseal | bool and __openbao_unseal_keys | length == 0)
+    fail_msg: >-
+      No init file was found for an initialized, sealed cluster.
+      A rolling restart of {{ __openbao_restart_order | join(', ') }} is
+      pending and would leave the restarted nodes sealed, but no unseal keys
+      were found in {{ openbao_init_output_path }} on the controller, so
+      nothing was restarted; the restarts stay pending. Set
+      openbao_init_output_path or openbao_cluster_id to the init file of this
+      cluster, or set openbao_unseal: false and unseal each restarted node by
+      hand.
+    quiet: true
+  run_once: true
+  when:
+    - __openbao_cluster_initialized | bool
+    - __openbao_restart_order | length > 0
   tags: restart
 
 - name: Report the nodes that would be restarted

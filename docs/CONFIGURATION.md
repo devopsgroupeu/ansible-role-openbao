@@ -93,7 +93,7 @@ Path variables must be the same on every node of a cluster (see [Notes](#notes))
 | `openbao_tls_cert_key_type` | `"ECC"` | Key type of generated keys: `ECC` or `RSA`. |
 | `openbao_tls_cert_curve` | `"secp384r1"` | Curve of generated ECC keys. |
 | `openbao_tls_cert_size` | `4096` | Size of generated RSA keys. |
-| `openbao_tls_cert_validity` | `"+825d"` | Validity of generated CA and node certificates (`community.crypto` relative time syntax). |
+| `openbao_tls_cert_validity` | `"+825d"` | Validity of generated CA and node certificates (`community.crypto` relative time syntax). Keep it above 90 days: the role renews the CA when it expires within 90 days and a node certificate within 30 days, so a shorter validity re-issues both (and reloads every node) on every run. |
 | `openbao_tls_leader_servername` | `"openbao.cluster.internal"` | Shared DNS SAN used as `leader_tls_servername` in every `retry_join` block (and as the CN of generated node certificates). BYO certificates must contain it. |
 | `openbao_tls_extra_sans` | `[]` | Extra SANs for generated certificates, already prefixed (`DNS:name`, `IP:address`). Every peer name and default IPv4, the host of `openbao_api_addr`, `DNS:localhost` and `IP:127.0.0.1` are always included. |
 | `openbao_tls_install_ca_to_trust_store` | `true` | Install `openbao_tls_ca_file` into the OS trust store as `openbao-ca.crt` (`update-ca-certificates` on Debian/Ubuntu, `update-ca-trust` on EL). |

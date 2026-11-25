@@ -7,10 +7,10 @@
 #}
 # BEGIN ANSIBLE MANAGED AUDIT DEVICE
 {% if openbao_audit_enabled | bool %}
-audit "file" "{{ openbao_audit_path }}" {
+audit "file" {{ openbao_audit_path | string | to_json }} {
   options {
-    file_path = "{{ openbao_audit_file_path }}"
-    mode      = "{{ openbao_audit_file_mode }}"
+    file_path = {{ openbao_audit_file_path | string | to_json }}
+    mode      = {{ openbao_audit_file_mode | string | to_json }}
 {% for key, value in openbao_audit_options | dictsort %}
     {{ key }} = {{ (value | lower if value is boolean else value | string) | to_json }}
 {% endfor %}

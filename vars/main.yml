@@ -12,6 +12,8 @@ __openbao_min_version: "2.7.2"
 # Package dependencies installed before OpenBao, keyed by OS family.
 # python3-debian is required by ansible.builtin.deb822_repository on Debian/Ubuntu;
 # gpg/gnupg2 verifies the signing key, release checksums and KMS plugins.
+# openssl is the one dependency of the openbao package; on EL the package is
+# installed with only the openbao repository enabled, so it must be present.
 __openbao_pkg_deps:
   Debian:
     - ca-certificates
@@ -26,6 +28,7 @@ __openbao_pkg_deps:
     - tar
     - gzip
     - logrotate
+    - openssl
 
 # Python dependencies of community.crypto, installed before generating TLS.
 __openbao_tls_pkg_deps:

@@ -156,6 +156,7 @@ openbao_tls_cert_curve: "secp384r1"
 openbao_tls_cert_size: 4096
 
 # Validity of generated certificates (community.crypto ownca_not_after syntax).
+# Keep it above 90 days: the CA is renewed when it expires within 90 days.
 openbao_tls_cert_validity: "+825d"
 
 # Shared DNS SAN used as leader_tls_servername in every retry_join block.

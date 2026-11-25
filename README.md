@@ -306,8 +306,9 @@ plugin change writes `/etc/openbao/.ansible-restart-pending` on that node right
 away; the rolling restart restarts the flagged nodes one at a time, standbys
 first and the leader last, after a quorum check and with a health gate (unsealed
 and sees a leader). A failed check stops the play with quorum intact, and the
-markers make the next run finish the job. Certificate changes reload instead of
-restarting.
+markers make the next run finish the job. With Shamir and `openbao_unseal: true`
+the role restarts nothing while the unseal keys cannot be read from the init
+file. Certificate changes reload instead of restarting.
 
 ### Check mode
 
@@ -353,14 +354,16 @@ molecule test -s raft-ha
 ```
 
 Every scenario includes the `idempotence` step. The images default to
-`debian12`; set `MOLECULE_DISTRO=ubuntu2404` or `debian13` for the others. The
-CI pipeline (`ci.yml`) runs on every push and pull request to `main` and
-`develop`: `yamllint` and `ansible-lint --profile production`, then `render`
-and `default` on `debian12`, `ubuntu2404` and `debian13`, `autounseal` on
-`debian12` and `ubuntu2404`, and `raft-ha` on `debian12`. EL 9 is a declared
-platform without a CI leg: its RedHat-family branches (`dnf`,
-`yum_repository`, `rpm_key`, `restorecon`, `update-ca-trust`) are covered by
-lint only, as in the Vault role, and no EL 9 Molecule run is recorded yet.
+`debian12`; set `MOLECULE_DISTRO=ubuntu2404`, `debian13` or `rockylinux9` for
+the others. The CI pipeline (`ci.yml`) runs on every push and pull request to
+`main` and `develop`: `yamllint` and `ansible-lint --profile production`, then
+`render` on `debian12`, `ubuntu2404` and `debian13`, `default` on those three
+and `rockylinux9`, `autounseal` on `debian12` and `ubuntu2404`, and `raft-ha`
+on `debian12`. `MOLECULE_DISTRO=rockylinux9 molecule test -s default` passed
+locally (arm64) before it joined CI; it runs the EL 9 package path (`dnf`,
+`yum_repository`, `rpm_key`), while `restorecon` and `update-ca-trust` are
+covered by lint only (SELinux is off in the container and the scenario does
+not touch the trust store).
 
 ---
 

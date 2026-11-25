@@ -9,8 +9,9 @@
 # Then the root token is revoked and every later play runs the role without
 # it (Review Focus 2). The day-2 plays follow: wrong Ansible Vault password,
 # logrotate, certificate rotation (Review Focus 5), maintenance stop and
-# start (Review Focus 3), the three in-place change guards and, last, the
-# re-init refusal, which wipes the data directory. Plays that re-include the
+# start (Review Focus 3), the three in-place change guards, the restart
+# refusal without unseal keys and, last, the re-init refusal, which wipes the
+# data directory. Plays that re-include the
 # role repeat the converge vars (plays do not inherit them).
 
 - name: Verify install and service
@@ -930,6 +931,142 @@
           - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
         fail_msg: openbao.hcl changed during the failed run
         success_msg: openbao.hcl is byte-identical after the failed run
+
+# A pending restart of a Shamir node needs the unseal keys: a run from a
+# controller without the init file must refuse before the restart (the node
+# would come back sealed) and keep the marker; the next run with the init file
+# restarts the node once and unseals it.
+- name: Negative - restart without unseal keys
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read the InvocationID before the refused run
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_before
+      changed_when: false
+
+    - name: Record a pending restart
+      ansible.builtin.copy:
+        content: "restart pending\n"
+        dest: /etc/openbao/.ansible-restart-pending
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with an init file path that does not exist
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/no-such-init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-default
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'No init file was found for an initialized, sealed cluster.' in ansible_failed_result['msg']"
+              - "'nothing was restarted' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Read the InvocationID after the refused run
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_refused
+      changed_when: false
+
+    - name: Stat the restart marker after the refused run
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_refused
+
+    - name: Read the seal status after the refused run
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_refused
+
+    - name: Assert nothing was restarted and the restart is still pending
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_refused['stdout'] == __verify_invocation_before['stdout']
+          - __verify_marker_refused['stat']['exists']
+          - not __verify_seal_refused['json']['sealed']
+        fail_msg: >-
+          InvocationID {{ __verify_invocation_before['stdout'] }} ->
+          {{ __verify_invocation_refused['stdout'] }}, marker
+          {{ __verify_marker_refused['stat']['exists'] }}, seal status
+          {{ __verify_seal_refused['json'] | to_json }}
+        success_msg: the node was not restarted, stays unsealed and keeps its restart marker
+
+    - name: Include the role with the init file
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-default
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_peers:
+          - openbao-default
+        openbao_tls_install_ca_to_trust_store: false
+        openbao_tls_extra_sans:
+          - DNS:rotate2.example
+
+    - name: Read the InvocationID after the run with the init file
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_healed
+      changed_when: false
+
+    - name: Stat the restart marker after the run with the init file
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_healed
+
+    - name: Read the seal status after the run with the init file
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_healed
+
+    - name: Assert the pending restart ran and the node is unsealed again
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_healed['stdout'] != __verify_invocation_refused['stdout']
+          - not __verify_marker_healed['stat']['exists']
+          - __verify_seal_healed['json']['initialized']
+          - not __verify_seal_healed['json']['sealed']
+        fail_msg: >-
+          InvocationID {{ __verify_invocation_refused['stdout'] }} ->
+          {{ __verify_invocation_healed['stdout'] }}, marker
+          {{ __verify_marker_healed['stat']['exists'] }}, seal status
+          {{ __verify_seal_healed['json'] | to_json }}
+        success_msg: the node restarted once, is unsealed and the marker is gone
 
 # Last play (anti-goal 4): a wiped node of a cluster whose init file exists
 # must not be initialized again. Leaves the node uninitialized.

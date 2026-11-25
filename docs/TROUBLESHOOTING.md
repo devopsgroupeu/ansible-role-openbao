@@ -709,18 +709,21 @@ again; it initializes a new cluster.
 ### No init file was found for an initialized, sealed cluster.
 
 **Symptom:** the run stops in "Assert unseal keys are available for the sealed
-nodes" (cluster-wide); the message lists the sealed nodes and the path it
-looked at.
+nodes" (cluster-wide; the message lists the sealed nodes and the path it
+looked at), or in "Assert unseal keys are available for the restart" (the
+message lists the nodes that need a restart; nothing was restarted).
 
-**Cause:** Shamir with `openbao_unseal: true`, some nodes are sealed (after a
-reboot or restart), and no unseal keys were found at
-`openbao_init_output_path`: another controller or user ran the bootstrap (the
-default path is under the home directory of the user that ran it), the
-`openbao_cluster_id` changed, or a CI runner lost its workspace.
+**Cause:** Shamir with `openbao_unseal: true`, and no unseal keys were found at
+`openbao_init_output_path` while some nodes are sealed (after a reboot or
+restart) or need a rolling restart (they would come back sealed):
+another controller or user ran the bootstrap (the default path is under the
+home directory of the user that ran it), the `openbao_cluster_id` changed, or
+a CI runner lost its workspace.
 
 **Fix:** point `openbao_init_output_path` (or `openbao_cluster_id`) at the init
 file of this cluster, or set `openbao_unseal: false` and unseal by hand.
 Pipelines must keep the init file on persistent, access-controlled storage.
+Pending restarts stay recorded and run on the next run that finds the keys.
 
 ### Could not decrypt the init file.
 
@@ -851,7 +854,11 @@ guard, a quorum check, a health gate), the next run finishes the job.
 at a time (standbys first, leader last) and removes the markers. Do not delete
 a marker by hand unless you restarted that node yourself after the change. To
 force a health-gated restart of a node, create the marker as root
-(`touch /etc/openbao/.ansible-restart-pending`) and run the role.
+(`touch /etc/openbao/.ansible-restart-pending`) and run the role. A raised
+`openbao_version` with the `install` stage skipped (for example
+`--tags config,restart`) restarts every node on each such run without
+upgrading it, because the running version still differs: run the full role
+once.
 
 ### Upgrading OpenBao
 

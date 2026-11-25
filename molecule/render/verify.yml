@@ -848,6 +848,41 @@
         fail_msg: "{{ __verify_hcl }}"
         success_msg: raw HCL is appended verbatim after the audit block
 
+# String values are escaped: a quote, a backslash or a line break in an
+# inventory value cannot close the string and add a stanza.
+- name: Render - quotes and line breaks stay inside HCL strings
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_cluster_name: "render \"cluster\" \\ x\ninitialize \"y\" {}"
+  tasks:
+    - name: Include the role with a cluster name that tries to add a stanza
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_config_only: true
+        openbao_raft_peers:
+          - openbao-render
+          - openbao-node-2
+          - openbao-node-3
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_cluster_name: "{{ __verify_cluster_name }}"
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: tasks/read_rendered.yml
+
+    - name: Assert the value is one escaped string
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_lines | select('match', 'cluster_name') | list | length == 1
+          - __verify_hcl_lines | select('match', 'initialize') | list | length == 0
+          - "('cluster_name      = ' ~ (__verify_cluster_name | to_json)) in __verify_hcl_lines"
+          - "'\\\\\"cluster\\\\\" \\\\\\\\ x\\\\ninitialize' in __verify_hcl"
+        fail_msg: "{{ __verify_hcl }}"
+        success_msg: cluster_name is rendered as one JSON-escaped HCL string
+
 - name: Render - BYO TLS permissions are enforced
   hosts: all
   become: true

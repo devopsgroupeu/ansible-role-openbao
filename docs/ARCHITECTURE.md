@@ -159,7 +159,8 @@ sequenceDiagram
 - Before each restart every other member must answer `sys/health` as active or
   standby; after it the node must be unsealed and see a leader. A failed check
   stops the play with quorum intact. The leader goes last, so leadership moves
-  once per rolling restart.
+  once per rolling restart. With Shamir and `openbao_unseal: true` nothing is
+  restarted while the unseal keys cannot be read from the init file.
 - Certificate changes reload (SIGHUP) the nodes that were already running
   before this run; they are never restarted for a certificate. A node stopped
   with `openbao_service_state: stopped` stays stopped.
