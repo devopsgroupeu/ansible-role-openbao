@@ -1,0 +1,105 @@
+---
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # Manual runs from the Actions tab. No inputs: every scenario always runs.
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: yamllint
+        run: yamllint .
+      - name: ansible-lint
+        run: ansible-lint --profile production .
+
+  molecule:
+    name: molecule / ${{ matrix.scenario }} / ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      # Every scenario runs on every push and pull request, raft-ha included
+      # (three systemd containers fit a standard runner). The live scenarios
+      # run on Debian-family containers. EL 9 is a declared platform
+      # (meta/main.yml) without a CI leg: its RedHat-family branches (dnf,
+      # yum_repository, rpm_key, restorecon, update-ca-trust) are covered by
+      # lint only, as in the Vault role. The README Tests section says how
+      # EL 9 was tested.
+      matrix:
+        include:
+          # render - offline template rendering and the fail-closed input checks
+          - scenario: render
+            distro: debian12
+          - scenario: render
+            distro: ubuntu2404
+          - scenario: render
+            distro: debian13
+          # default - signed package install, generated TLS, init, unseal,
+          # audit and the single-node day-2 checks (check mode, certificate
+          # rotation, maintenance stop, in-place change guards)
+          - scenario: default
+            distro: debian12
+          - scenario: default
+            distro: ubuntu2404
+          - scenario: default
+            distro: debian13
+          # autounseal - verified binary install, static seal, KMS plugin install
+          - scenario: autounseal
+            distro: debian12
+          - scenario: autounseal
+            distro: ubuntu2404
+          # raft-ha - three nodes: upgrade, rolling restart, quorum check,
+          # node replacement
+          - scenario: raft-ha
+            distro: debian12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Molecule scenario
+        run: molecule test -s ${{ matrix.scenario }}
+        env:
+          PY_COLORS: "1"
+          ANSIBLE_FORCE_COLOR: "1"
+          MOLECULE_DISTRO: ${{ matrix.distro }}
+
+  ci-success:
+    # The single required status check for branch protection.
+    name: ci-success
+    runs-on: ubuntu-latest
+    needs: [lint, molecule]
+    if: always()
+    steps:
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "A required CI job (lint or molecule) did not succeed."
+          exit 1
+      - name: Confirm required jobs passed
+        run: echo "lint + molecule succeeded"
