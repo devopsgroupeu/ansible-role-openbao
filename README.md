@@ -24,10 +24,16 @@ restarts, systemd hardening and Prometheus telemetry.
   Install via: `ansible-galaxy collection install -r requirements.yml`
 - **Target OS:** Ubuntu 24.04 (noble), Debian 12/13 (bookworm/trixie),
   RHEL/Rocky/Alma 9; systemd with cgroup v2; amd64 or arm64
-- **OpenBao version:** 2.7.3 (default; override via `openbao_version`, minimum 2.7.2)
+- **OpenBao version:** 2.7.3 (default; override via `openbao_version`, minimum 2.7.2;
+  the upstream RPM repository lacks some patch releases, 2.7.2 among them, so
+  on EL pin such a version with the binary method or a mirror)
 - **Network:** HTTPS from the targets to openbao.org (signing key) and
-  pkgs.openbao.org (package method) or github.com (binary method, KMS
-  plugins), or to your mirrors
+  pkgs.openbao.org (package method) or github.com plus
+  release-assets.githubusercontent.com (binary method, and the KMS plugins of
+  the cloud seals with either method; GitHub redirects every release download
+  to that host and has changed it before, objects.githubusercontent.com was
+  used earlier), or to your mirrors (`openbao_binary_base_url`,
+  `openbao_seal_plugin_base_url`)
 - **Controller:** an Ansible Vault password file for the init output (the
   output is encrypted by default)
 - **Docker (Molecule):** required for running tests locally
@@ -140,21 +146,31 @@ See `examples/` for all complete playbooks.
   changed keeps a restart marker until it was restarted, so a re-run after a
   failure finishes the rolling restart. Nodes that already restarted are not
   restarted again.
+- **One play, linear, no `serial`:** the whole group runs in one play with the
+  default linear strategy; the role refuses `serial` and `strategy: free`
+  (the rolling behaviour is inside the role).
 - **`--limit`:** day-2 runs on part of the cluster need
   `openbao_raft_retry_join_api_addrs` with the API URLs of all members; the
   role refuses otherwise. Initialization always needs the whole group.
 - **`--tags`:** every stage has a tag (`install`, `config`, `tls`, `service`,
   `init_unseal`, `restart`); it reaches the tasks when the role is used through
   `roles:` or `import_role`.
-- **Replacing a node:** provision a fresh host with the same inventory name and
-  run the play; it joins through `retry_join` and is unsealed, nothing is
-  initialized again.
+- **Maintenance:** `openbao_service_state: stopped` on one host stops that
+  node; the others are still converged and unsealed, but no rolling restart
+  (quorum check) and no init run until it is started again.
+- **Replacing a node:** remove the dead peer first (`bao operator raft
+  remove-peer <node id>` from a healthy member), provision a fresh host with
+  an empty data directory and run the play; it joins through `retry_join` as
+  a new peer and is unsealed, nothing is initialized again.
 - **Limits:** a single node has downtime on every restart. With Shamir and
   `openbao_unseal: false` (or PGP-wrapped shares) the rolling restart waits
   `openbao_restart_health_timeout` seconds for you to unseal each restarted
-  node, and stops the play if nobody does. Seal type and raft node id changes
-  are refused on nodes with data (manual procedures in
+  node, and stops the play if nobody does. Seal type, seal key and raft node
+  id changes are refused on nodes with data, and so is a data directory of
+  another storage backend (manual procedures in
   [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#in-place-change-guards)).
+  After a Shamir rekey, update the init file (see
+  [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#node-stays-sealed-after-bao-operator-rekey)).
 
 ---
 
@@ -200,7 +216,9 @@ Supply BYO certificates (the default) with the SAN
 to every node**; use it for dev/test only. The role re-signs and reloads
 (SIGHUP, no restart) the generated certificates it manages. When you rotate BYO
 files, run `systemctl reload openbao` on each node, or set `tls_auto_reload:
-true` in `openbao_listener_extra_parameters`.
+true` in `openbao_listener_extra_parameters`. A reload re-reads all of
+`openbao.hcl`, not only the certificates (see
+[Rolling restart and the restart marker](#rolling-restart-and-the-restart-marker)).
 
 ### Init output
 
@@ -214,7 +232,12 @@ Later runs read the unseal keys from this file, so **only a user who can read
 it and the password file can re-unseal Shamir nodes** and run rolling restarts
 on them. CI runners and pipelines must point `openbao_init_output_path` at
 persistent, access-controlled storage. Never commit the file; `.gitignore`
-covers `.openbao_init_*.json`.
+covers `.openbao_init_*.json`. The password file is read like
+`ansible-vault --vault-password-file` reads it (surrounding whitespace
+stripped); one that holds only whitespace is refused before init. During a
+run the unseal keys (and right after init the init output) exist only in
+host variables of the `init_unseal` and `restart` stages, which clear them
+at their end.
 
 ### Unseal keys vs recovery keys
 
@@ -248,7 +271,9 @@ sealed until you install a new token.
 
 The `static` seal keeps a 32-byte key in `openbao.env` on every node: anyone
 with root on a node can unseal the data. It is meant for test setups and for
-keys injected by an existing trust source, not as a general auto-unseal.
+keys injected by an existing trust source, not as a general auto-unseal. The
+role cannot rotate the static key (no `previous_key` support): keep the key
+and its id once the cluster is initialized.
 
 ### Signing key pin
 
@@ -301,21 +326,27 @@ role does not touch host swap.
 
 ### Rolling restart and the restart marker
 
-The role never restarts all nodes at once. A config, unit, package, binary or
-plugin change writes `/etc/openbao/.ansible-restart-pending` on that node right
-away; the rolling restart restarts the flagged nodes one at a time, standbys
-first and the leader last, after a quorum check and with a health gate (unsealed
-and sees a leader). A failed check stops the play with quorum intact, and the
+The role never restarts all nodes at once. A pending config or unit change
+writes `/etc/openbao/.ansible-restart-pending` on that node before the file
+changes, and a package, binary or plugin change right after the install; the
+rolling restart restarts the flagged nodes one at a time, standbys first and
+the leader last, after a quorum check and with a health gate (unsealed and
+sees a leader). A failed check stops the play with quorum intact, and the
 markers make the next run finish the job. With Shamir and `openbao_unseal: true`
 the role restarts nothing while the unseal keys cannot be read from the init
-file. Certificate changes reload instead of restarting.
+file. Certificate changes reload instead of restarting. A reload (SIGHUP, also
+the nightly logrotate reload) makes OpenBao re-read `openbao.hcl` and apply
+the log level, audit device additions and removals and KMS plugin stanzas at
+once; storage, listener addresses, seal and `openbao.env` changes wait for
+the restart.
 
 ### Check mode
 
 `--check --diff` is supported on hosts that were converged by this role at
-least once. It reports pending file and package changes, never initializes,
-unseals, restarts or reloads anything, and fails only for real validation
-errors. Check mode on a fresh host is not supported (the service user and
+least once. It reports pending file and package changes and the nodes that a
+real run would restart (`Check mode: would restart ...`, counting the changes
+of the same check run), never initializes, unseals, restarts or reloads
+anything, and fails only for real validation errors. Check mode on a fresh host is not supported (the service user and
 binary do not exist yet).
 
 ### Secrets the role cannot keep off the targets
@@ -340,16 +371,21 @@ pip install -r requirements.txt
 # Offline rendering of every config branch and the fail-closed input checks
 molecule test -s render
 
-# Single node: signed package install, generated TLS, init, unseal, audit,
-# check mode, certificate rotation, maintenance stop, in-place change guards
+# Single node: signed package install, generated TLS, init, unseal, audit
+# off and on again, check mode, certificate and key rotation, maintenance
+# stop, --check and --tags through roles:, in-place change guards, foreign
+# data directory, blank password file
 molecule test -s default
 
-# Single node: verified binary install, static auto-unseal, KMS plugin
-# install, download verification failures, signing key pin
+# Single node: verified binary install, static auto-unseal, seal key guard,
+# KMS plugin install, validate-config of the cloud seal configs, a hardened
+# instance that starts the AWS KMS plugin, download verification failures,
+# signing key pin
 molecule test -s autounseal
 
 # Three nodes: 2.7.2 to 2.7.3 rolling upgrade, quorum check, healing after a
-# failed run, node replacement, inventory group guard
+# failed run, one member in maintenance, serial and free strategy refused,
+# node replacement with remove-peer, inventory group guard
 molecule test -s raft-ha
 ```
 
@@ -361,9 +397,14 @@ the others. The CI pipeline (`ci.yml`) runs on every push and pull request to
 and `rockylinux9`, `autounseal` on `debian12` and `ubuntu2404`, and `raft-ha`
 on `debian12`. `MOLECULE_DISTRO=rockylinux9 molecule test -s default` passed
 locally (arm64) before it joined CI; it runs the EL 9 package path (`dnf`,
-`yum_repository`, `rpm_key`), while `restorecon` and `update-ca-trust` are
-covered by lint only (SELinux is off in the container and the scenario does
-not touch the trust store).
+`yum_repository`, `rpm_key`), while the SELinux tasks (`semanage fcontext`,
+`restorecon`) and `update-ca-trust` are covered by lint only (SELinux is off
+in the container and the scenario does not touch the trust store). The
+SELinux part was checked against the EL 9 targeted policy (selinux-policy
+38.1.86) in a Rocky Linux 9 container: `sesearch` shows that `logrotate_t`
+may only read `usr_t` files but may create, rename and unlink `var_log_t`
+ones, and `semanage fcontext --add` / `--list --locallist` behave as the role
+expects.
 
 ---
 

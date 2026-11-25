@@ -340,9 +340,13 @@ in "Assert the Ansible Vault password file is usable".
 
 **Cause:** `openbao_init_encrypt_output` is true but
 `openbao_init_encrypt_password_file` is empty, or (second task) the file is
-missing, unreadable or empty on the controller. The role checks this before
-init, because the init output exists only once: keys that cannot be stored
-safely would be lost.
+missing, unreadable, empty or holds only whitespace on the controller (for
+example `echo "$UNSET_SECRET" > pass` in a pipeline writes a single line
+break). The role reads the password like `ansible-vault
+--vault-password-file` does, with leading and trailing whitespace stripped,
+and checks it before init, because the init output exists only once: keys
+that cannot be stored safely would be lost, and keys "encrypted" with an
+empty password are not protected.
 
 **Fix:** point `openbao_init_encrypt_password_file` at a controller-side
 Ansible Vault password file (for example
@@ -366,6 +370,25 @@ when facts were gathered, leaves them out.
 **Fix:** run against the whole group, or, for a day-2 `--limit` run, set
 `openbao_raft_retry_join_api_addrs` to the API URLs of all members (exactly
 each node's `openbao_api_addr`). Initialization always needs the whole group.
+
+### The role needs the linear strategy without serial.
+
+**Symptom:** the run stops in "Validate the play strategy and batch size"
+right after validation, before anything is installed. With `strategy: free`
+the message names a member other than the first one in play order; with
+`serial` it names the batch.
+
+**Cause:** the cluster-wide tasks read the other members' facts through
+`hostvars` and drive the rolling restart from `run_once` tasks. That needs
+the default linear strategy with every member in one batch. Under the free
+strategy Ansible ignores `run_once`, so every host would run its own rolling
+restart at the same time; with `serial` the members of later batches have no
+facts yet.
+
+**Fix:** remove `strategy` and `serial` from the play. The rolling behaviour
+(one node at a time, quorum check, leader last) is inside the role. For a
+day-2 run on part of the cluster use `--limit` with
+`openbao_raft_retry_join_api_addrs`.
 
 ---
 
@@ -395,6 +418,25 @@ purpose (upstream published a new release key):
    gpg-pubkey-<id>` (`rpm -q gpg-pubkey --qf '%{NAME}-%{VERSION}-%{RELEASE} %{SUMMARY}\n'`
    lists them).
 4. Run the role.
+
+### No package for the pinned version on EL
+
+**Symptom:** on an EL host with `openbao_install_method: package` the run
+stops in "Install the openbao package (RHEL/EL, exact version pin)" with
+`No package openbao-<version> available`, while the same version installs on
+Debian or Ubuntu.
+
+**Cause:** the upstream RPM repository at pkgs.openbao.org does not carry
+every patch release. Its metadata is updated incrementally for each release
+(`createrepo_c --update --includepkg`), and a release published on the same
+day as another one is missing from it: on 2026-11-25 the x86_64 and aarch64
+metadata listed 2.6.6, 2.7.0, 2.7.1 and 2.7.3, but neither 2.7.2 (the
+minimum this role supports) nor 2.6.5. The APT repository has them.
+
+**Fix:** pin a version the repository lists
+(`dnf --disablerepo='*' --enablerepo=openbao list --showduplicates openbao`),
+or install that version with `openbao_install_method: binary` (signed release
+tarball), or point `openbao_rpm_repo_baseurl` at a mirror that holds the RPM.
 
 ### Downgrade refused.
 
@@ -554,12 +596,36 @@ start.
 
 ## In-place change guards
 
-These guards (`tasks/config.yml`) compare the existing `openbao.hcl` of each
-node with the new settings (the node id and seal guards only on nodes that
-hold raft data) and fail before anything is rendered. A run that a guard refused may still have installed a new package,
+These guards (`tasks/config.yml`) compare the existing `openbao.hcl` and the
+data directory of each node with the new settings (the node id and seal
+guards only on nodes that hold raft data) and fail before anything is
+rendered. A run that a guard refused may still have installed a new package,
 binary or plugin earlier in the same run; the restart that change needs is
 recorded and happens on the next successful run (see
 [Pending restart after a failed run](#pending-restart-after-a-failed-run)).
+
+### Data directory holds another storage backend.
+
+**Symptom:** the run stops in "Refuse a data directory of another storage
+backend"; the message lists the files it found in `openbao_data_dir`.
+
+**Cause:** the data directory has no `vault.db` (the raft marker) but is not
+empty. Since 2.7.1 the package's own `/etc/openbao/openbao.hcl` uses
+`storage "pebbledb"` in `/opt/openbao/data`, the role's default data
+directory, so a node that was started once with the packaged config (the
+upstream quick start) holds a pebble store there (`CURRENT`, `MANIFEST-*`,
+`OPTIONS-*`, `*.sst`, `*.log`). Rendered over it, raft storage would start an
+empty, uninitialized node next to that data, and a later run would initialize
+a new cluster without any message about the old secrets.
+
+**Fix:** if the data matters, move it to raft first: stop openbao and run
+`bao operator migrate` with a migration config (`storage_source "pebbledb"`
+with the old path, `storage_destination "raft"` with an empty directory and
+`cluster_addr`, see https://openbao.org/docs/commands/operator/migrate/),
+then point `openbao_data_dir` at the raft directory (or move it into place).
+If it holds nothing you need, stop openbao and empty the directory
+(`find /opt/openbao/data -mindepth 1 -delete`), then re-run. The guard
+ignores `lost+found`, so a data directory on its own file system passes.
 
 ### Raft node id change refused.
 
@@ -591,6 +657,30 @@ OpenBao performs only through `bao operator unseal -migrate`.
 [Seal migration](#seal-migration)). If the node was never initialized, empty
 `openbao_data_dir` first.
 
+### Seal key change refused.
+
+**Symptom:** the run stops in "Refuse a seal key change"; the message lists
+each changed setting with its old and its new value.
+
+**Cause:** the seal type stays the same, but a setting that selects the key
+changed: `current_key_id` (static), `mount_path`, `key_name` or `namespace`
+(transit), `region` or `kms_key_id` (awskms), `vault_name` or `key_name`
+(azurekeyvault), `project`, `region`, `key_ring` or `crypto_key` (gcpckms).
+Unsealing with another key is a seal migration as well; rendered as a plain
+config change it would reach every node, and each restarted node would stay
+sealed. The guard compares the rendered values, so writing the same KMS key
+in another form (key id, key ARN or `alias/<name>`) counts as a change too.
+The transit `address` is not compared: the unsealer may move to another DNS
+name.
+
+**Fix:** restore the old values, or migrate to the new key by hand first (see
+[Seal migration](#seal-migration); upstream does not support an awskms to
+awskms migration). The static seal key cannot be rotated through the role:
+it renders no `previous_key` / `previous_key_id`, so keep
+`openbao_seal_static_current_key` and its id once the cluster is initialized.
+A new static key value under the same id is not visible to the guard (the key
+is a secret in `openbao.env`) and leaves restarted nodes sealed the same way.
+
 ### Audit devices cannot be modified in place.
 
 **Symptom:** the run stops in "Refuse an in-place audit device change"
@@ -607,6 +697,10 @@ whitespace-normalized blocks and sees only the hosts in the play.
 
 1. Run with `openbao_audit_enabled: false`. The rolling restart applies it, and
    the node that becomes active removes the device (its HMAC salt is lost).
+   The unit keeps `openbao_audit_dir` writable meanwhile, because every node
+   still opens the stored device when it unseals. A reload (SIGHUP) of the
+   active node, for example the nightly logrotate, can remove the device
+   before the restart reaches it.
 2. Confirm the device is gone before going on: `bao audit list` (with a token)
    must no longer list `file/` (with no device left it prints
    `No audit devices are enabled.`). The removal happens only when a node with the new config became active, so if
@@ -621,9 +715,10 @@ the same way but not covered by the guard.
 
 ### Seal migration
 
-**Symptom:** you need another seal for an initialized cluster (for example
-Shamir to transit or AWS KMS), and the role refuses with
-[Seal type change refused.](#seal-type-change-refused).
+**Symptom:** you need another seal or seal key for an initialized cluster (for
+example Shamir to transit or AWS KMS, or another transit key), and the role
+refuses with [Seal type change refused.](#seal-type-change-refused) or
+[Seal key change refused.](#seal-key-change-refused).
 
 **Cause:** the role does not migrate seals (out of scope); OpenBao does it with
 the old and the new seal configured side by side.
@@ -639,13 +734,25 @@ cluster back to the role:
    `plugin_directory` and the `plugin "kms"` stanza) to `openbao.hcl`, mark an
    old auto-unseal stanza `disabled = "true"`, and put new credentials into
    `openbao.env`. Do not run the role during the migration: it would re-render
-   both files.
-4. Restart the standbys one at a time, then the leader, and on each node run
-   `bao operator unseal -migrate` with the old unseal or recovery keys.
-5. When all nodes run the new seal, remove the disabled old stanza, set
-   `openbao_seal_type` and its variables in the inventory and run the role.
-   The guard reads the seal of the current `openbao.hcl`, so it passes, and the
-   role renders its own version of the file (one more rolling restart).
+   both files. Do not reload either (`systemctl reload`, logrotate): a reload
+   applies plugin stanzas at once.
+4. Restart the standbys one at a time with this config. After each restart run
+   `bao operator unseal -migrate` on that node with the old unseal keys
+   (Shamir) or recovery keys (auto-unseal), and wait until it is back as a
+   standby before you take the next one down, so raft keeps its quorum.
+5. Step down the active node (`bao operator step-down`, needs a token). A
+   migrated standby becomes active and performs the migration: wait for
+   `seal migration complete` in its log, then give the migration a moment to
+   replicate to all nodes.
+6. On the old active node, replace the seal configuration with the new seal
+   only (no old stanza, no `disabled` stanza) and restart it, without
+   `-migrate`. It auto-unseals with the new seal, or needs the new unseal keys
+   for Shamir.
+7. On the other nodes, remove the old (disabled) seal stanza from
+   `openbao.hcl` as well, so every file names only the new seal: the seal
+   guards read the seal of the current file. Then set `openbao_seal_type` and
+   its variables in the inventory and run the role. It renders its own
+   version of the file on every node and restarts them one at a time.
 
 The init file on the controller keeps the key set of the original init. After
 a migration to Shamir (the recovery keys become the unseal keys) the role
@@ -662,14 +769,15 @@ hand, or add those keys to the file as `unseal_keys_hex` and
 **Symptom:** the run stops in "Assert the whole cluster is in the play"
 (cluster-wide), before `operator init`.
 
-**Cause:** no play host reports initialized, but a member of
-`openbao_raft_peers` is not in the play: `--limit`, `serial`, or a member that
-failed earlier in the run (for example its API did not answer the probe). The
-role initializes only when it can see every member answer "not initialized",
-so it never creates a second cluster next to an existing one.
+**Cause:** no probed play host reports initialized, but a member of
+`openbao_raft_peers` was not probed: it is not in the play (`--limit`), it
+failed earlier in the run (for example its API did not answer the probe), or
+it runs with `openbao_service_state: stopped`. The role initializes only when
+it can see every member answer "not initialized", so it never creates a
+second cluster next to an existing one.
 
-**Fix:** run the first bootstrap against all members, without `--limit` or
-`serial`, and fix the member that failed.
+**Fix:** run the first bootstrap against all members, without `--limit` and
+with every member started, and fix the member that failed.
 
 ### A previous init file exists for this cluster id.
 
@@ -780,6 +888,32 @@ bao operator unseal   # repeat until the threshold is reached
 For unattended restarts use an auto-unseal seal (`transit`, `awskms`,
 `azurekeyvault`, `gcpckms`).
 
+### Node stays sealed after bao operator rekey
+
+**Symptom:** after a Shamir rekey (`bao operator rekey`, the rotation of the
+unseal keys), the next rolling restart or post-reboot run stops in "Unseal the
+restarted node" or one of the "Unseal ..." tasks with censored output (the
+tasks are `no_log`), or in the health gate, and the node stays sealed.
+
+**Cause:** the role unseals with `unseal_keys_hex` and `unseal_threshold`
+from the init file written at bootstrap. A rekey replaces the key shares (and
+maybe the threshold) in the cluster, not in that file, so the role submits
+the old shares.
+
+**Fix:** after every rekey, write the new shares into the init file on the
+controller, before the next restart:
+
+```bash
+ansible-vault edit --vault-password-file ~/.openbao-vault-pass \
+  ~/.openbao/.openbao_init_<cluster id>.json
+# replace unseal_keys_hex (and unseal_keys_b64) with the new shares,
+# set unseal_threshold to the new threshold
+```
+
+Or set `openbao_unseal: false` and unseal by hand from then on. A recovery
+key rekey (`bao operator rekey -target=recovery`, auto-unseal seals) does not
+affect the role, which never uses recovery keys.
+
 ### Auto-unseal node stays sealed
 
 **Symptom:** a node with an auto-unseal seal starts but stays sealed; the
@@ -843,12 +977,24 @@ the remaining nodes.
 **Symptom:** a run that changes nothing still restarts a node, or check mode
 reports `Check mode: would restart <nodes>`.
 
-**Cause:** restart intent is persistent. A change of `openbao.hcl`,
-`openbao.env`, the unit, the package, the binary or the plugin writes
-`/etc/openbao/.ansible-restart-pending` on that node right away, and a node
-whose running version (`sys/seal-status`) differs from `openbao_version` also
-needs a restart. If the earlier run failed before its rolling restart (a
-guard, a quorum check, a health gate), the next run finishes the job.
+**Cause:** restart intent is persistent. A pending change of `openbao.hcl`,
+`openbao.env` or the unit writes `/etc/openbao/.ansible-restart-pending` on
+that node before the file is written (the role compares the files in check
+mode first), so a run that stops in between (a failed validate hook, a lost
+connection, Ctrl-C) cannot lose it. A package, binary or plugin change writes
+the marker right after the install, and a node whose running version
+(`sys/seal-status`) differs from `openbao_version` also needs a restart. If
+the earlier run failed before its rolling restart (a guard, a quorum check, a
+health gate), the next run finishes the job. In check mode the role writes no
+marker; a pending render or package change in the same check run is counted
+as well, so the report matches the real run.
+
+Until the restart, a pending `openbao.hcl` is partly live already: every
+reload (SIGHUP; the role's certificate reload and the nightly logrotate
+reload) makes OpenBao re-read the file and apply the log level, declarative
+audit device additions and removals (on the active node) and KMS plugin
+stanzas (a changed plugin is respawned) on that node at once. Storage,
+listener addresses, seal and `openbao.env` changes wait for the restart.
 
 **Fix:** nothing to do: the next successful run restarts the flagged nodes one
 at a time (standbys first, leader last) and removes the markers. Do not delete
@@ -908,14 +1054,25 @@ restart.
 
 **Cause:** not an error; the procedure relies on `retry_join`.
 
-**Fix:** provision a fresh host with the same inventory name (BYO TLS: with its
-certificates in place) and run the role against the whole group. No node is
-initialized again, because the other members report initialized; the new
-node joins through `retry_join` under the same node id and is unsealed. If the
-replacement gets another inventory name or node id, remove the dead peer by
-hand: `bao operator raft remove-peer <old id>` (autopilot
-`cleanup_dead_servers` is off by default). In generated TLS mode, replacing the
-bootstrap node creates a new CA, and every node is re-signed and reloaded.
+**Fix:** a node that lost its data must not come back under its old raft
+membership: it no longer has the log entries and votes the cluster counted
+on, which is outside the safety assumptions of raft. Upstream removes an
+unrecoverable server first:
+
+1. From a healthy member, with a token:
+   `bao operator raft remove-peer <node id>` (the old node id, by default the
+   inventory name). Check with `bao operator raft list-peers`.
+2. Provision the fresh host (same inventory name or a new one; BYO TLS: with
+   its certificates in place) with an empty `openbao_data_dir`.
+3. Run the role against the whole group. No node is initialized again,
+   because the other members report initialized; the new node joins through
+   `retry_join` as a new peer and is unsealed.
+
+Re-joining a wiped node under its old id without `remove-peer` happens to
+work when the cluster is otherwise healthy, but do not rely on it. Autopilot
+`cleanup_dead_servers` is off by default. In generated TLS mode, replacing
+the bootstrap node creates a new CA, and every node is re-signed and
+reloaded.
 
 ### Requests fail because the audit log cannot be written
 
@@ -929,10 +1086,39 @@ The device is replicated, so every node must be able to write its file.
 **Fix:** free space and keep `openbao_audit_logrotate_enabled: true`; when
 rotating by hand, run `systemctl reload openbao` afterwards so the device
 reopens its file. Check the rule with `logrotate -d /etc/logrotate.d/openbao`.
-On EL with SELinux enforcing, logrotate may be denied renaming files under
-`/opt`; check `ausearch -m avc -c logrotate` after the first rotation and, if
-needed, label the directory as a log directory (`semanage fcontext -a -t
-var_log_t '/opt/openbao/audit(/.*)?'` and `restorecon -R /opt/openbao/audit`).
+On EL with SELinux enabled the role labels `openbao_audit_dir` as a log
+directory (`semanage fcontext -a -t var_log_t '<dir>(/.*)?'`, then
+`restorecon`): under `/opt` the directory would be `usr_t`, which the confined
+logrotate domain may read but not rename or create, so the daily rotation
+would be denied and the log would grow until the disk is full. With
+`openbao_manage_selinux: false` add that file context yourself; check
+`ausearch -m avc -c logrotate` after the first rotation.
+
+### No active node after an audit change
+
+**Symptom:** after a restart every node is unsealed, but none becomes active:
+`sys/leader` shows no leader, the role waits in "Wait until every node sees a
+leader" or in the restart health gate, and the journal repeats
+`sanity check failed; unable to open "<file>" for writing` followed by
+`post-unseal setup failed` (or `read-only post-unseal setup failed` on
+standbys).
+
+**Cause:** the audit table is replicated, and a node opens every stored file
+device when it unseals, before it removes the devices no longer declared in
+`openbao.hcl`. If one of them points at a file the process cannot open (a
+path outside `openbao_audit_dir`, which `ProtectSystem=strict` keeps
+read-only, a directory that does not exist on this node, wrong owner), no
+node can finish its post-unseal setup. The role keeps `openbao_audit_dir`
+writable whether or not `openbao_audit_enabled` is set, so its own device
+cannot cause this; a second device in `openbao_extra_config_hcl` or one
+enabled by hand can.
+
+**Fix:** make the file writable again on every node: put it back under
+`openbao_audit_dir` (or create the missing directory with owner
+`openbao`), then re-render and restart. A normal run stops at the leader wait
+before its rolling restart, so run only the stages that apply it:
+`--tags config,restart` (with `roles:` or `import_role`). Once a node is
+active it removes the undeclared devices; only then move or drop the path.
 
 ### OpenBao refuses to start with a disable_mlock error
 
@@ -1011,7 +1197,8 @@ ls -l /etc/openbao/.ansible-restart-pending
 # Certificate SANs, issuer and expiry
 openssl x509 -in /opt/openbao/tls/openbao-cert.pem -noout -ext subjectAltName -issuer -enddate
 
-# Reload certificates in place (SIGHUP, no restart, stays unsealed)
+# Reload in place (SIGHUP, no restart, stays unsealed): re-reads openbao.hcl
+# and applies certificates, log level, audit devices and KMS plugin stanzas
 systemctl reload openbao
 
 # Read the init output on the controller

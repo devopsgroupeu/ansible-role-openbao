@@ -76,7 +76,11 @@ flowchart TD
 
 `tasks/main.yml` only orchestrates. Every stage is its own task file with its
 own tag; the whole cluster group runs in one play with the default linear
-strategy and no `serial`. The rolling behaviour is inside the role.
+strategy and no `serial` (`facts.yml` refuses both). The rolling behaviour is
+inside the role. The API stages (7 and 8) aggregate over the started members
+only: a member with `openbao_service_state: stopped` is neither probed nor
+restarted, counts as missing for init, and fails the quorum check of every
+restart.
 
 | Step | Task file | Tag | Runs when |
 |---|---|---|---|
@@ -96,16 +100,17 @@ sequenceDiagram
     participant O as openbao2, openbao3
 
     Note over C,O: 1-2. validate.yml and facts.yml (fail closed, nothing installed yet)
-    C->>C: argument specs, 26 input rules, address facts, --limit guard
+    C->>C: argument specs, 26 input rules, strategy and batch check, address facts, --limit guard
 
     Note over C,O: 3. install.yml (all nodes)
     C->>B: verify signing key fingerprint, install pinned package or verified tarball (and KMS plugin)
     C->>O: same, restart marker written when the software changed
 
     Note over C,O: 4. config.yml (all nodes)
-    C->>B: guards: raft node id, seal type, audit device (cluster-wide)
+    C->>B: guards: foreign data dir, raft node id, seal type and key, audit device (cluster-wide)
+    C->>B: compare the three files in check mode, restart marker when one would change
     C->>B: render openbao.env, openbao.hcl (validate-config), openbao.service
-    C->>O: same, restart marker written when a file changed
+    C->>O: same
 
     Note over C,O: 5-6. tls.yml and service.yml
     C->>B: CA (generate mode) and node certificate, OS trust store
@@ -151,11 +156,13 @@ sequenceDiagram
   cluster is in the play (`openbao_init`). The init output is encrypted before
   it touches the controller disk (`openbao_init_encrypt_output`,
   `openbao_init_encrypt_password_file`) and is never overwritten.
-- Restart intent is persistent: a change of `openbao.hcl`, `openbao.env`, the
-  unit, the package, the binary or the plugin writes
-  `<openbao_config_dir>/.ansible-restart-pending` on that node right away. A
-  run that fails before step 8 leaves the marker, and the next run restarts
-  the node. A running version other than `openbao_version` flags a node too.
+- Restart intent is persistent: a pending change of `openbao.hcl`,
+  `openbao.env` or the unit writes `<openbao_config_dir>/.ansible-restart-pending`
+  on that node before the file is written (a check-mode comparison runs
+  first), and a package, binary or plugin change right after the install. A
+  run that stops before step 8, even between a render and the next task,
+  leaves the marker, and the next run restarts the node. A running version
+  other than `openbao_version` flags a node too.
 - Before each restart every other member must answer `sys/health` as active or
   standby; after it the node must be unsealed and see a leader. A failed check
   stops the play with quorum intact. The leader goes last, so leadership moves
@@ -163,7 +170,14 @@ sequenceDiagram
   restarted while the unseal keys cannot be read from the init file.
 - Certificate changes reload (SIGHUP) the nodes that were already running
   before this run; they are never restarted for a certificate. A node stopped
-  with `openbao_service_state: stopped` stays stopped.
+  with `openbao_service_state: stopped` stays stopped. A reload is more than a
+  certificate reload: OpenBao re-reads `openbao.hcl` and applies the log
+  level, declarative audit device additions and removals (on the active node)
+  and KMS plugin stanzas (a changed plugin is respawned) at once, and the
+  nightly logrotate reload does the same on every node. So a rendered config
+  is partly live before its rolling restart; storage, listener addresses,
+  seal and environment changes wait for the restart.
 - `--check --diff` on converged hosts reports pending file and package changes
-  and the nodes that would be restarted; it never initializes, unseals,
-  restarts or reloads anything.
+  and the nodes that would be restarted (including those whose files would
+  change in this run); it never initializes, unseals, restarts or reloads
+  anything.

@@ -60,10 +60,11 @@
 # ==============================================================================
 #
 #   - TLS: BYO certificates as described in examples/raft_cluster.yml.
-#   - Outbound HTTPS to openbao.org, pkgs.openbao.org and github.com (KMS
-#     plugin release), or mirrors set through openbao_gpg_key_url,
-#     openbao_apt_repo_url (openbao_rpm_repo_baseurl on EL) and
-#     openbao_seal_plugin_base_url.
+#   - Outbound HTTPS to openbao.org, pkgs.openbao.org, github.com and
+#     release-assets.githubusercontent.com (the KMS plugin release; GitHub
+#     redirects the download there), or mirrors set through
+#     openbao_gpg_key_url, openbao_apt_repo_url (openbao_rpm_repo_baseurl on
+#     EL) and openbao_seal_plugin_base_url.
 #   - An Ansible Vault password file (mode 0600) that encrypts the init output.
 #
 # Usage:
