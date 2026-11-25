@@ -1,7 +1,8 @@
 ---
 # ==============================================================================
-# Config (spec section 5.4): directories, openbao.env, openbao.hcl,
-# openbao.service, restart marker, logrotate rule, SELinux contexts.
+# Config (spec section 5.4): directories, in-place change guards, openbao.env,
+# openbao.hcl, openbao.service, restart marker, logrotate rule, SELinux
+# contexts.
 # Runs in config-only mode too; the steps that need an installed host are
 # gated on openbao_config_only.
 # ==============================================================================
@@ -31,6 +32,136 @@
   loop_control:
     label: "{{ item['path'] }}"
   when: item['enabled'] | default(true) | bool
+  tags: config
+
+# ==============================================================================
+# In-place change guards (spec section 5.4 step 2). OpenBao cannot change the
+# raft node id, the seal or a declarative audit device of an existing node
+# through the config file, so these checks fail closed before anything is
+# rendered. Skipped in config-only mode. Produces per host:
+#   __openbao_has_raft_data     the node has raft data (vault.db exists)
+#   __openbao_old_node_id       node_id of the existing openbao.hcl ('' if none)
+#   __openbao_old_seal_type     seal of the existing openbao.hcl ('shamir' if
+#                               it has no seal stanza or does not exist)
+#   __openbao_audit_old_block   text between the audit markers of the existing
+#   __openbao_audit_new_block   openbao.hcl and of audit.hcl.j2 rendered now,
+#                               whitespace-normalized ('' if absent)
+# ==============================================================================
+
+- name: Read the settings of the existing node
+  when: not openbao_config_only | bool
+  tags: config
+  block:
+    - name: Stat the existing openbao.hcl
+      ansible.builtin.stat:
+        path: "{{ openbao_config_dir }}/openbao.hcl"
+      register: __openbao_old_hcl_stat
+      tags: config
+
+    - name: Read the existing openbao.hcl
+      ansible.builtin.slurp:
+        src: "{{ openbao_config_dir }}/openbao.hcl"
+      register: __openbao_old_hcl
+      when: __openbao_old_hcl_stat['stat']['exists']
+      tags: config
+
+    - name: Stat the raft data of this node
+      ansible.builtin.stat:
+        path: "{{ openbao_data_dir }}/vault.db"
+      register: __openbao_raft_db_stat
+      tags: config
+
+    # The marker lines are the compatibility contract of audit.hcl.j2; the
+    # layout between them may change between releases.
+    - name: Record the old and the new guarded settings
+      ansible.builtin.set_fact:
+        __openbao_has_raft_data: "{{ __openbao_raft_db_stat['stat']['exists'] }}"
+        __openbao_old_node_id: >-
+          {{ __openbao_old_hcl_text
+             | regex_search('(?m)^\s*node_id\s*=\s*"([^"]*)"', '\1')
+             | default([''], true) | first }}
+        __openbao_old_seal_type: >-
+          {{ __openbao_old_hcl_text
+             | regex_search('(?m)^seal "([a-z]+)"', '\1')
+             | default(['shamir'], true) | first }}
+        __openbao_audit_old_block: >-
+          {{ __openbao_old_hcl_text
+             | regex_search(__openbao_audit_markers_re, '\1')
+             | default([''], true) | first
+             | regex_replace('\s+', ' ') | trim }}
+        __openbao_audit_new_block: >-
+          {{ lookup('ansible.builtin.template', 'audit.hcl.j2')
+             | regex_search(__openbao_audit_markers_re, '\1')
+             | default([''], true) | first
+             | regex_replace('\s+', ' ') | trim }}
+      vars:
+        __openbao_old_hcl_text: "{{ (__openbao_old_hcl['content'] | b64decode) if __openbao_old_hcl_stat['stat']['exists'] else '' }}"
+        __openbao_audit_markers_re: '(?s)# BEGIN ANSIBLE MANAGED AUDIT DEVICE\n(.*?)# END ANSIBLE MANAGED AUDIT DEVICE'
+      tags: config
+
+- name: Refuse a raft node id change
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (__openbao_has_raft_data | bool
+             and __openbao_old_node_id | length > 0
+             and __openbao_old_node_id != openbao_raft_node_id | string)
+    fail_msg: >-
+      Raft node id change refused.
+      {{ inventory_hostname }} has raft data in {{ openbao_data_dir }} and its
+      openbao.hcl sets node_id '{{ __openbao_old_node_id }}', but
+      openbao_raft_node_id is '{{ openbao_raft_node_id }}'. The raft node id
+      of an existing node cannot change. Restore
+      openbao_raft_node_id: '{{ __openbao_old_node_id }}', or remove the peer
+      with 'bao operator raft remove-peer {{ __openbao_old_node_id }}', wipe
+      {{ openbao_data_dir }} and let the node re-join with the new id.
+    quiet: true
+  when: not openbao_config_only | bool
+  tags: config
+
+- name: Refuse a seal type change
+  ansible.builtin.assert:
+    that:
+      - not (__openbao_has_raft_data | bool and __openbao_old_seal_type != openbao_seal_type)
+    fail_msg: >-
+      Seal type change refused.
+      {{ inventory_hostname }} has raft data in {{ openbao_data_dir }} and its
+      openbao.hcl uses the '{{ __openbao_old_seal_type }}' seal, but
+      openbao_seal_type is '{{ openbao_seal_type }}'. Changing the seal of an
+      initialized node is a manual seal migration (see
+      docs/TROUBLESHOOTING.md); until then keep
+      openbao_seal_type: '{{ __openbao_old_seal_type }}'. If the node was never
+      initialized, wipe {{ openbao_data_dir }} first.
+    quiet: true
+  when: not openbao_config_only | bool
+  tags: config
+
+# Cluster-wide: OpenBao replicates the audit table, so the old devices of all
+# play hosts and the new settings of all play hosts must agree. Blocks
+# without a device are ignored, so adding a device (no old stanza anywhere)
+# and removing it (openbao_audit_enabled: false) pass, and a replaced node
+# without an old file is compared against its peers.
+- name: Refuse an in-place audit device change
+  ansible.builtin.assert:
+    that:
+      - __openbao_audit_blocks | length <= 1
+    fail_msg: >-
+      Audit devices cannot be modified in place.
+      The existing openbao.hcl files and the new settings of the play hosts
+      declare {{ __openbao_audit_blocks | length }} different audit devices
+      (whitespace-normalized): {{ __openbao_audit_blocks | join(' <> ') }}.
+      OpenBao refuses a changed declarative audit device at the next unseal.
+      Set openbao_audit_enabled: false and apply it to the whole cluster, then
+      re-enable the device with the new values (this creates a new device
+      with a new HMAC salt). The guard sees only the hosts in this play.
+    quiet: true
+  vars:
+    __openbao_audit_blocks: >-
+      {{ ((ansible_play_hosts | map('extract', hostvars, '__openbao_audit_old_block') | list)
+          + (ansible_play_hosts | map('extract', hostvars, '__openbao_audit_new_block') | list))
+         | select('search', 'audit "') | unique | list }}
+  run_once: true
+  when: not openbao_config_only | bool
   tags: config
 
 # ==============================================================================

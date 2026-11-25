@@ -1,0 +1,30 @@
+---
+# Side effect for the default scenario (spec section 10): record the systemd
+# InvocationID of openbao.service on the controller right before Molecule's
+# check step (converge.yml with --check). verify.yml asserts it is unchanged,
+# which proves that check mode restarted nothing.
+
+- name: Record the InvocationID of openbao.service
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the InvocationID of openbao.service
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_id
+      changed_when: false
+
+    - name: Assert openbao.service has an InvocationID
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_id['stdout'] | length > 0
+        fail_msg: openbao.service reports no InvocationID (not running)
+        success_msg: "InvocationID {{ __verify_invocation_id['stdout'] }}"
+
+    - name: Store the InvocationID on the controller
+      ansible.builtin.copy:
+        content: "{{ __verify_invocation_id['stdout'] }}\n"
+        dest: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/invocation-id"
+        mode: "0600"
+      delegate_to: localhost
+      become: false

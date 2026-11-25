@@ -1,6 +1,8 @@
 ---
 # Single node, full install from the signed package repository: generated
-# TLS, hardened unit, service start (spec section 12.2, List B).
+# TLS, hardened unit, service start, init and unseal, then the day-2 checks
+# (check mode, logrotate, certificate rotation, maintenance stop, in-place
+# change guards, re-init refusal) of spec section 12.2, List B.
 # Run with: molecule test -s default (MOLECULE_DISTRO=ubuntu2404 or debian13
 # for the other Debian-family images).
 
@@ -55,6 +57,10 @@ scenario:
     - prepare
     - converge
     - idempotence
+    # side_effect records the InvocationID; check runs converge.yml with
+    # --check; verify asserts the InvocationID is unchanged (spec section 10).
+    - side_effect
+    - check
     - verify
     - cleanup
     - destroy
