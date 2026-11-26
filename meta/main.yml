@@ -3,10 +3,10 @@ galaxy_info:
   author: DevOpsGroup
   company: DevOpsGroup s.r.o
   description: >
-    Production-ready Ansible role for installing and configuring OpenBao as a
-    TLS-enabled Raft HA cluster with idempotent init and unseal (Shamir, static,
-    transit, cloud KMS plugins), declarative audit, health-gated rolling
-    restarts, systemd hardening and Prometheus telemetry.
+    Production-ready Ansible role for OpenBao as a TLS-enabled Raft HA cluster
+    with idempotent init and unseal (Shamir, static, transit, cloud KMS),
+    declarative audit, health-gated rolling restarts, systemd hardening and
+    Prometheus telemetry.
 
   license: Apache-2.0
   min_ansible_version: "2.19"
