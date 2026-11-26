@@ -1,12 +1,12 @@
 ---
 # Single node, full install from the signed package repository: generated
-# TLS, hardened unit, service start, init and unseal, then the day-2 checks
-# (check mode, audit device off and on, logrotate, certificate and key
-# rotation, maintenance stop, --check and --tags through roles:, in-place
-# change guards, foreign data directory, blank password file, re-init
-# refusal) of spec section 12.2, List B.
-# Run with: molecule test -s default (MOLECULE_DISTRO=ubuntu2404 or debian13
-# for the other Debian-family images).
+# TLS, hardened unit, service start, init and unseal, idempotence, a check
+# mode run that restarts nothing, the encrypted init output, the audit device
+# and logrotate. CI runs this smoke test on every supported distribution; the
+# distribution-independent day-2 and fail-closed cases of spec section 12.2,
+# List B, are the day2 and negative scenarios.
+# Run with: molecule test -s default (MOLECULE_DISTRO=ubuntu2404, debian13 or
+# rockylinux9 for the other images).
 
 dependency:
   name: galaxy

@@ -377,11 +377,20 @@ pip install -r requirements.txt
 # Offline rendering of every config branch and the fail-closed input checks
 molecule test -s render
 
-# Single node: signed package install, generated TLS, init, unseal, audit
-# off, moved and on again, check mode, certificate and key rotation,
-# maintenance stop, --check and --tags through roles:, in-place change guards,
-# foreign data directory, blank password file
+# Single node smoke test: signed package install, generated TLS, init,
+# unseal, idempotence, check mode, encrypted init output, audit device,
+# logrotate
 molecule test -s default
+
+# Single node day-2 operations: audit off, moved and on again, root token
+# revoked, wrong Ansible Vault password, certificate and key rotation,
+# maintenance stop, --check and --tags through roles:, restart after a failed
+# render
+molecule test -s day2
+
+# Single node fail-closed guards: in-place change guards, restart without
+# unseal keys, foreign data directory, blank password file, re-init refusal
+molecule test -s negative
 
 # Single node: verified binary install, static auto-unseal, seal key guard,
 # KMS plugin install, validate-config of the cloud seal configs, a hardened
@@ -396,14 +405,17 @@ molecule test -s autounseal
 molecule test -s raft-ha
 ```
 
-Every scenario includes the `idempotence` step. The images default to
-`debian12`; set `MOLECULE_DISTRO=ubuntu2404`, `debian13` or `rockylinux9` for
-the others. The CI pipeline (`ci.yml`) runs on every push and pull request to
-`main` and `develop`: `yamllint` and `ansible-lint --profile production`, then
-`render` on `debian12`, `ubuntu2404` and `debian13`, `default` on those three
-and `rockylinux9`, `autounseal` on `debian12` and `ubuntu2404`, and `raft-ha`
-on `debian12`. `MOLECULE_DISTRO=rockylinux9 molecule test -s default` passed
-locally (arm64) before it joined CI; it runs the EL 9 package path (`dnf`,
+Every scenario except `day2` and `negative` includes the `idempotence` step
+(most of their cases change the node on purpose or end in an intended
+failure). The images default to `debian12`; set
+`MOLECULE_DISTRO=ubuntu2404`, `debian13` or `rockylinux9` for the others. The
+CI pipeline (`ci.yml`) runs on every push and pull request to `main` and
+`develop`: `yamllint` and `ansible-lint --profile production`, then the
+`default` smoke test on `debian12`, `ubuntu2404`, `debian13` and
+`rockylinux9`, and `render`, `day2`, `negative`, `autounseal` and `raft-ha`
+once on `debian12`, because what they test does not depend on the
+distribution. `MOLECULE_DISTRO=rockylinux9 molecule test -s default` runs
+the EL 9 package path (`dnf`,
 `yum_repository`, `rpm_key`), while the SELinux tasks (`semanage fcontext`,
 `restorecon`) and `update-ca-trust` are covered by lint only (SELinux is off
 in the container and the scenario does not touch the trust store). The
@@ -448,7 +460,7 @@ ansible-role-openbao/
 |   |-- openbao.env.j2             # the only file with secrets
 |   |-- openbao.service.j2         # hardened unit
 |   `-- logrotate.j2               # audit log rotation
-|-- molecule/{render,default,autounseal,raft-ha}/
+|-- molecule/{render,default,day2,negative,autounseal,raft-ha}/
 |-- examples/{single_node,raft_cluster,autounseal_transit,autounseal_awskms}.yml
 |   `-- inventory/openbao_cluster.yml
 |-- docs/{ARCHITECTURE,CONFIGURATION,INTEGRATION,TROUBLESHOOTING}.md

@@ -1,0 +1,667 @@
+---
+# Verify for the negative scenario (spec section 12.2, List B, fail-closed
+# part): the in-place change guards (audit device, audit directory, seal
+# type, raft node id), the restart refusal without unseal keys, a data
+# directory of another storage backend and, last, the blank password file
+# and re-init refusals, which leave the data directory empty. converge.yml
+# adds the SAN of the day2 maintenance plays, so each case changes only the
+# value it tests. Plays that re-include the role repeat the converge vars
+# (plays do not inherit them).
+
+# In-place change guards (spec section 5.4 step 2): each case must fail
+# before anything is rendered, so openbao.hcl stays byte-identical. The SAN
+# list stays as in converge.yml, so nothing else would change.
+- name: Negative - audit device change
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with changed audit options
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+            openbao_audit_options:
+              hmac_accessor: "false"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Audit devices cannot be modified in place.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Assert openbao.hcl is unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+        fail_msg: openbao.hcl changed during the failed run
+        success_msg: openbao.hcl is byte-identical after the failed run
+
+# Disabling the device and moving openbao_audit_dir in one run (review
+# round 2): the stored device would sit outside ReadWritePaths of the new
+# unit, and every restarted node opens it at unseal. Refused before anything
+# is rendered, so openbao.hcl and the unit stay byte-identical.
+- name: Negative - audit directory change with the device disabled
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl and unit checksums before the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /etc/openbao/openbao.hcl
+        - /etc/systemd/system/openbao.service
+      register: __verify_auditdir_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the device disabled and a new audit directory
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+            openbao_audit_enabled: false
+            openbao_audit_dir: /opt/openbao/audit-moved
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Audit directory change refused.' in ansible_failed_result['msg']"
+              - "'/opt/openbao/audit/openbao_audit.log' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl and unit checksums after the run
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha1
+      loop:
+        - /etc/openbao/openbao.hcl
+        - /etc/systemd/system/openbao.service
+      register: __verify_auditdir_after
+
+    - name: Assert openbao.hcl and the unit are unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_auditdir_after['results'] | map(attribute='stat.checksum') | list == __verify_auditdir_before['results'] | map(attribute='stat.checksum') | list
+        fail_msg: openbao.hcl or openbao.service changed during the failed run
+        success_msg: openbao.hcl and openbao.service are byte-identical after the failed run
+
+- name: Negative - seal type change
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the static seal
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+            openbao_seal_type: static
+            openbao_seal_static_current_key_id: k1
+            openbao_seal_static_current_key: "{{ '0' * 64 }}"
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Seal type change refused.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Assert openbao.hcl is unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+        fail_msg: openbao.hcl changed during the failed run
+        success_msg: openbao.hcl is byte-identical after the failed run
+
+- name: Negative - raft node id change
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with another raft node id
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+            openbao_raft_node_id: other
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Raft node id change refused.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Assert openbao.hcl is unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+        fail_msg: openbao.hcl changed during the failed run
+        success_msg: openbao.hcl is byte-identical after the failed run
+
+# A pending restart of a Shamir node needs the unseal keys: a run from a
+# controller without the init file must refuse before the restart (the node
+# would come back sealed) and keep the marker; the next run with the init file
+# restarts the node once and unseals it.
+- name: Negative - restart without unseal keys
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read the InvocationID before the refused run
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_before
+      changed_when: false
+
+    - name: Record a pending restart
+      ansible.builtin.copy:
+        content: "restart pending\n"
+        dest: /etc/openbao/.ansible-restart-pending
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with an init file path that does not exist
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/no-such-init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'No init file was found for an initialized, sealed cluster.' in ansible_failed_result['msg']"
+              - "'nothing was restarted' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Read the InvocationID after the refused run
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_refused
+      changed_when: false
+
+    - name: Stat the restart marker after the refused run
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_refused
+
+    - name: Read the seal status after the refused run
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_refused
+
+    - name: Assert nothing was restarted and the restart is still pending
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_refused['stdout'] == __verify_invocation_before['stdout']
+          - __verify_marker_refused['stat']['exists']
+          - not __verify_seal_refused['json']['sealed']
+        fail_msg: >-
+          InvocationID {{ __verify_invocation_before['stdout'] }} ->
+          {{ __verify_invocation_refused['stdout'] }}, marker
+          {{ __verify_marker_refused['stat']['exists'] }}, seal status
+          {{ __verify_seal_refused['json'] | to_json }}
+        success_msg: the node was not restarted, stays unsealed and keeps its restart marker
+
+    - name: Include the role with the init file
+      ansible.builtin.include_role:
+        name: ansible-role-openbao
+      vars:
+        openbao_init_key_shares: 1
+        openbao_init_key_threshold: 1
+        openbao_init_encrypt_output: true
+        openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+        openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+        openbao_cluster_id: molecule-default
+        openbao_tls_generate_certs: true
+        openbao_api_addr: "https://127.0.0.1:8200"
+        openbao_cluster_addr: "https://127.0.0.1:8201"
+        openbao_raft_peers:
+          - openbao-negative
+        openbao_tls_install_ca_to_trust_store: false
+        openbao_tls_extra_sans:
+          - DNS:rotate2.example
+
+    - name: Read the InvocationID after the run with the init file
+      ansible.builtin.command: systemctl show openbao -p InvocationID --value  # noqa: command-instead-of-module
+      register: __verify_invocation_healed
+      changed_when: false
+
+    - name: Stat the restart marker after the run with the init file
+      ansible.builtin.stat:
+        path: /etc/openbao/.ansible-restart-pending
+      register: __verify_marker_healed
+
+    - name: Read the seal status after the run with the init file
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_healed
+
+    - name: Assert the pending restart ran and the node is unsealed again
+      ansible.builtin.assert:
+        that:
+          - __verify_invocation_healed['stdout'] != __verify_invocation_refused['stdout']
+          - not __verify_marker_healed['stat']['exists']
+          - __verify_seal_healed['json']['initialized']
+          - not __verify_seal_healed['json']['sealed']
+        fail_msg: >-
+          InvocationID {{ __verify_invocation_refused['stdout'] }} ->
+          {{ __verify_invocation_healed['stdout'] }}, marker
+          {{ __verify_marker_healed['stat']['exists'] }}, seal status
+          {{ __verify_seal_healed['json'] | to_json }}
+        success_msg: the node restarted once, is unsealed and the marker is gone
+
+# A data directory without vault.db but with other files (the pebbledb store
+# of the package's own config) must be refused before anything is rendered,
+# or OpenBao would start an empty raft node next to it. The data of this node
+# is wiped here; the next play wipes it anyway.
+- name: Negative - data directory of another storage backend
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Stop openbao.service
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: stopped
+
+    - name: Find the contents of the data directory
+      ansible.builtin.find:
+        paths: /opt/openbao/data
+        file_type: any
+        hidden: true
+      register: __verify_data_entries
+
+    - name: Remove the contents of the data directory
+      ansible.builtin.file:
+        path: "{{ item['path'] }}"
+        state: absent
+      loop: "{{ __verify_data_entries['files'] }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+
+    # File names of a pebble store.
+    - name: Create the files of a foreign store
+      ansible.builtin.copy:
+        content: "foreign store\n"
+        dest: "/opt/openbao/data/{{ item }}"
+        owner: openbao
+        group: openbao
+        mode: "0600"
+      loop:
+        - CURRENT
+        - MANIFEST-000001
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Record the openbao.hcl checksum before the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_before
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the converge vars
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+            openbao_tls_extra_sans:
+              - DNS:rotate2.example
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'Data directory holds another storage backend.' in ansible_failed_result['msg']"
+              - "'CURRENT, MANIFEST-000001' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the openbao.hcl checksum after the run
+      ansible.builtin.stat:
+        path: /etc/openbao/openbao.hcl
+        checksum_algorithm: sha1
+      register: __verify_hcl_after
+
+    - name: Stat vault.db after the refused run
+      ansible.builtin.stat:
+        path: /opt/openbao/data/vault.db
+      register: __verify_vault_db
+
+    - name: Gather service facts after the refused run
+      ansible.builtin.service_facts:
+
+    - name: Assert nothing was rendered or started
+      ansible.builtin.assert:
+        that:
+          - __verify_hcl_after['stat']['checksum'] == __verify_hcl_before['stat']['checksum']
+          - not __verify_vault_db['stat']['exists']
+          - ansible_facts['services']['openbao.service']['state'] != 'running'
+        fail_msg: >-
+          openbao.hcl changed: {{ __verify_hcl_after['stat']['checksum'] != __verify_hcl_before['stat']['checksum'] }},
+          vault.db: {{ __verify_vault_db['stat']['exists'] }},
+          service {{ ansible_facts['services']['openbao.service'] | to_json }}
+        success_msg: the role refused the foreign store before rendering or starting anything
+
+    - name: Remove the files of the foreign store
+      ansible.builtin.file:
+        path: "/opt/openbao/data/{{ item }}"
+        state: absent
+      loop:
+        - CURRENT
+        - MANIFEST-000001
+      loop_control:
+        label: "{{ item }}"
+
+# Last play (anti-goal 4): a wiped node of a cluster whose init file exists
+# must not be initialized again. Leaves the node uninitialized.
+- name: Negative - re-init refusal
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_init_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+  tasks:
+    - name: Record the init file checksum before the run
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+        checksum_algorithm: sha1
+      register: __verify_init_before
+      delegate_to: localhost
+      become: false
+
+    - name: Stop openbao.service
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: stopped
+
+    - name: Find the contents of the data directory
+      ansible.builtin.find:
+        paths: /opt/openbao/data
+        file_type: any
+        hidden: true
+      register: __verify_data_entries
+
+    - name: Remove the contents of the data directory
+      ansible.builtin.file:
+        path: "{{ item['path'] }}"
+        state: absent
+      loop: "{{ __verify_data_entries['files'] }}"
+      loop_control:
+        label: "{{ item['path'] }}"
+
+    - name: Start openbao.service with an empty data directory
+      ansible.builtin.systemd_service:
+        name: openbao
+        state: started
+
+    # A password file that holds only a line break would encrypt the init
+    # output with an empty password; the init precondition must refuse it.
+    - name: Create a password file that holds only a line break
+      ansible.builtin.copy:
+        content: "\n"
+        dest: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/blank-pass.txt"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: Run the role with the blank password file and expect a failure
+      block:
+        - name: Include the role with the blank password file and a new init file path
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/blank-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init_blank.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the blank password message
+          ansible.builtin.assert:
+            that:
+              - "'Init output encryption requested but no password file set.' in ansible_failed_result['msg']"
+              - "'holds only whitespace' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Stat the init file of the blank password run
+      ansible.builtin.stat:
+        path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init_blank.json"
+      register: __verify_blank_init
+      delegate_to: localhost
+      become: false
+
+    - name: Read the seal status after the blank password run
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_after_blank
+
+    - name: Assert nothing was initialized or written
+      ansible.builtin.assert:
+        that:
+          - not __verify_blank_init['stat']['exists']
+          - not __verify_seal_after_blank['json']['initialized']
+        fail_msg: >-
+          init file written: {{ __verify_blank_init['stat']['exists'] }},
+          seal status {{ __verify_seal_after_blank['json'] | to_json }}
+        success_msg: the blank password file was refused before operator init
+
+    - name: Run the role and expect a failure
+      block:
+        - name: Include the role with the converge vars
+          ansible.builtin.include_role:
+            name: ansible-role-openbao
+          vars:
+            openbao_init_key_shares: 1
+            openbao_init_key_threshold: 1
+            openbao_init_encrypt_output: true
+            openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+            openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+            openbao_cluster_id: molecule-default
+            openbao_tls_generate_certs: true
+            openbao_api_addr: "https://127.0.0.1:8200"
+            openbao_cluster_addr: "https://127.0.0.1:8201"
+            openbao_raft_peers:
+              - openbao-negative
+            openbao_tls_install_ca_to_trust_store: false
+
+        - name: Fail because the role did not fail
+          ansible.builtin.fail:
+            msg: expected failure did not happen
+      rescue:
+        - name: Assert the expected message
+          ansible.builtin.assert:
+            that:
+              - "'A previous init file exists for this cluster id.' in ansible_failed_result['msg']"
+            fail_msg: "{{ ansible_failed_result['msg'] }}"
+
+    - name: Record the init file checksum after the run
+      ansible.builtin.stat:
+        path: "{{ __verify_init_file }}"
+        checksum_algorithm: sha1
+      register: __verify_init_after
+      delegate_to: localhost
+      become: false
+
+    - name: Read the seal status after the refused run
+      ansible.builtin.uri:
+        url: https://127.0.0.1:8200/v1/sys/seal-status
+        ca_path: /opt/openbao/tls/openbao-ca.pem
+        validate_certs: true
+        status_code: 200
+      register: __verify_seal_after_refusal
+
+    - name: Assert the init file is unchanged and nothing was initialized
+      ansible.builtin.assert:
+        that:
+          - __verify_init_after['stat']['checksum'] == __verify_init_before['stat']['checksum']
+          - not __verify_seal_after_refusal['json']['initialized']
+        fail_msg: >-
+          init file checksum {{ __verify_init_before['stat']['checksum'] }} ->
+          {{ __verify_init_after['stat']['checksum'] | default('missing') }},
+          seal status {{ __verify_seal_after_refusal['json'] | to_json }}
+        success_msg: the init file is byte-identical and the wiped node stayed uninitialized

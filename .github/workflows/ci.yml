@@ -39,23 +39,20 @@ jobs:
     strategy:
       fail-fast: false
       # Every scenario runs on every push and pull request, raft-ha included
-      # (three systemd containers fit a standard runner). The live scenarios
-      # run on Debian-family containers; default also runs on rockylinux9,
-      # which covers the EL 9 package path (dnf, yum_repository, rpm_key).
-      # semanage, restorecon and update-ca-trust stay lint-only (SELinux is
-      # off in the container and the scenario does not touch the trust store).
+      # (three systemd containers fit a standard runner). Only the default
+      # smoke test runs on every supported distribution: rockylinux9 covers
+      # the EL 9 package path (dnf, yum_repository, rpm_key). semanage,
+      # restorecon and update-ca-trust stay lint-only (SELinux is off in the
+      # container and the scenario does not touch the trust store). The
+      # other scenarios test behaviour that does not depend on the
+      # distribution and run once, on debian12.
       matrix:
         include:
           # render - offline template rendering and the fail-closed input checks
           - scenario: render
             distro: debian12
-          - scenario: render
-            distro: ubuntu2404
-          - scenario: render
-            distro: debian13
           # default - signed package install, generated TLS, init, unseal,
-          # audit and the single-node day-2 checks (check mode, certificate
-          # rotation, maintenance stop, in-place change guards)
+          # idempotence, check mode, audit device and logrotate
           - scenario: default
             distro: debian12
           - scenario: default
@@ -64,11 +61,17 @@ jobs:
             distro: debian13
           - scenario: default
             distro: rockylinux9
+          # day2 - audit device off and on, root token revoked, certificate
+          # and key rotation, maintenance stop, --check and --tags
+          - scenario: day2
+            distro: debian12
+          # negative - in-place change guards, restart without unseal keys,
+          # foreign data directory, re-init refusal
+          - scenario: negative
+            distro: debian12
           # autounseal - verified binary install, static seal, KMS plugin install
           - scenario: autounseal
             distro: debian12
-          - scenario: autounseal
-            distro: ubuntu2404
           # raft-ha - three nodes: upgrade, rolling restart, quorum check,
           # node replacement
           - scenario: raft-ha

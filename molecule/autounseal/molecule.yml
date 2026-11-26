@@ -8,8 +8,8 @@
 # auto-unseals, the seal key guard, the plugin files, validate-config of the
 # rendered cloud seal configs, a hardened second instance that starts the
 # AWS KMS plugin, the download verification failures and the signing key pin.
-# Run with: molecule test -s autounseal (MOLECULE_DISTRO=ubuntu2404 for the
-# other image of the CI matrix).
+# Run with: molecule test -s autounseal (CI runs it on debian12; the binary
+# and plugin install does not depend on the distribution).
 
 dependency:
   name: galaxy

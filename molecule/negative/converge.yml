@@ -1,0 +1,53 @@
+---
+# Converge for the negative scenario, the same as default plus the SAN of
+# the day2 maintenance plays: install from the signed package repository,
+# generated TLS, audit with logrotate, hardened unit, service start. The
+# verify plays re-include the role with the same vars.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # One Shamir share is enough for a single-node test cluster.
+    openbao_init_key_shares: 1
+
+    # Threshold must not exceed the share count.
+    openbao_init_key_threshold: 1
+
+    # Encrypt the init output (the role default), with a throwaway password.
+    openbao_init_encrypt_output: true
+
+    # Throwaway Ansible Vault password file created by prepare.yml.
+    openbao_init_encrypt_password_file: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/vault-pass.txt"
+
+    # Keep the init output in the ephemeral directory Molecule prunes.
+    openbao_init_output_path: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/openbao_init.json"
+
+    # Fixed cluster id instead of the inventory-derived default.
+    openbao_cluster_id: molecule-default
+
+    # No pre-placed certificates in the container: generate a CA and node cert.
+    openbao_tls_generate_certs: true
+
+    # Loopback API address: the generated certificate covers 127.0.0.1.
+    openbao_api_addr: "https://127.0.0.1:8200"
+
+    # Loopback cluster address for the single-node container.
+    openbao_cluster_addr: "https://127.0.0.1:8201"
+
+    # Single-node cluster.
+    openbao_raft_peers:
+      - openbao-negative
+
+    # Do not touch the OS trust store of the ephemeral container.
+    openbao_tls_install_ca_to_trust_store: false
+
+    # The SAN the verify plays pass, so a case changes only what it tests.
+    openbao_tls_extra_sans:
+      - DNS:rotate2.example
+
+  tasks:
+    - name: Include openbao role
+      ansible.builtin.include_role:
+        name: ansible-role-openbao

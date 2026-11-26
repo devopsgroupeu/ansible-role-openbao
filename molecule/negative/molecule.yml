@@ -1,0 +1,67 @@
+---
+# Single node, the converge of the default scenario, then the fail-closed
+# cases of spec section 12.2, List B: in-place change guards (audit device,
+# audit directory, seal type, raft node id), restart refusal without unseal
+# keys, a data directory of another storage backend, blank password file and
+# re-init refusal. A case that expects the role to fail wraps include_role in
+# block/rescue and asserts on the message, so the scenario fails only when a
+# guard does not fire. CI runs it on debian12 only. There is no idempotence
+# step: most cases end in an intended failure.
+# Run with: molecule test -s negative
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: openbao-negative
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - openbao
+
+provisioner:
+  name: ansible
+  playbooks:
+    # Same container preparation and controller-side test files as default.
+    prepare: ../default/prepare.yml
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - cleanup
+    - destroy

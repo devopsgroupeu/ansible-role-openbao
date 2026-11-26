@@ -39,7 +39,7 @@
 
     # Single-node cluster.
     openbao_raft_peers:
-      - openbao-default
+      - openbao-day2
 
     # Do not touch the OS trust store of the ephemeral container.
     openbao_tls_install_ca_to_trust_store: false
